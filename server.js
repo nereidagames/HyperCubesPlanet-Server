@@ -9,7 +9,6 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Struktura gracza: { ws, nickname, position, quaternion }
 const players = new Map();
 
 app.get('/ping', (req, res) => {
@@ -17,59 +16,59 @@ app.get('/ping', (req, res) => {
 });
 
 function broadcast(message, excludePlayerId = null) {
+  const messageStr = JSON.stringify(message);
+  console.log(`[SERVER BROADCAST] Rozgłaszam (do wszystkich oprócz ${excludePlayerId || 'nikogo'}): ${messageStr}`);
   players.forEach((playerData, playerId) => {
     if (playerId !== excludePlayerId && playerData.ws.readyState === playerData.ws.OPEN) {
-      playerData.ws.send(JSON.stringify(message));
+      playerData.ws.send(messageStr);
     }
   });
 }
 
 wss.on('connection', (ws) => {
   const playerId = crypto.randomUUID();
-  console.log(`Gracz dołączył z ID: ${playerId}`);
+  console.log(`[SERVER] Gracz dołączył z ID: ${playerId}`);
   
-  // Zapisujemy gracza z pustymi danymi na start
   players.set(playerId, { 
     ws: ws, 
     nickname: null,
-    position: { x: 0, y: 0.9, z: 0 }, // Domyślna pozycja startowa
+    position: { x: 0, y: 0.9, z: 0 },
     quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }
   });
 
-  // 1. Witamy nowego gracza i wysyłamy mu jego ID
-  ws.send(JSON.stringify({ type: 'welcome', id: playerId }));
+  const welcomeMsg = JSON.stringify({ type: 'welcome', id: playerId });
+  console.log(`[SERVER SEND] Wysyłam do ${playerId}: ${welcomeMsg}`);
+  ws.send(welcomeMsg);
   
-  // 2. Wysyłamy nowemu graczowi listę wszystkich, którzy już są w grze (z ich nickami i pozycjami)
   const existingPlayers = [];
   players.forEach((playerData, id) => {
     if (id !== playerId && playerData.nickname) { 
-      existingPlayers.push({ 
-        id: id, 
-        nickname: playerData.nickname,
-        position: playerData.position,
-        quaternion: playerData.quaternion
-      });
+      existingPlayers.push({ id, nickname: playerData.nickname, position: playerData.position, quaternion: playerData.quaternion });
     }
   });
+
   if (existingPlayers.length > 0) {
-      ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
+      const playerListMsg = JSON.stringify({ type: 'playerList', players: existingPlayers });
+      console.log(`[SERVER SEND] Wysyłam listę graczy do ${playerId}: ${playerListMsg}`);
+      ws.send(playerListMsg);
   }
 
   ws.on('message', (message) => {
     try {
       const data = JSON.parse(message);
+      console.log(`[SERVER RECEIVE] Otrzymano od ${playerId}: ${JSON.stringify(data)}`);
+      
       const currentPlayer = players.get(playerId);
       if (!currentPlayer) return;
 
       if (data.type === 'setNickname') {
         currentPlayer.nickname = data.nickname;
-        console.log(`Gracz ${playerId} ustawił nick na: ${data.nickname}`);
-        // Informujemy wszystkich pozostałych, że nowy gracz w pełni dołączył
+        console.log(`[SERVER INFO] Gracz ${playerId} ustawił nick na: ${data.nickname}`);
         broadcast({ 
             type: 'playerJoined', 
             id: playerId, 
             nickname: data.nickname,
-            position: currentPlayer.position, // Wyślij jego pozycję startową
+            position: currentPlayer.position,
             quaternion: currentPlayer.quaternion
         }, playerId);
         return;
@@ -88,11 +87,9 @@ wss.on('connection', (ws) => {
       }
       
       if (data.type === 'playerMove') {
-        // Zaktualizuj pozycję gracza na serwerze
         currentPlayer.position = data.position;
         currentPlayer.quaternion = data.quaternion;
         
-        // Roześlij informację o ruchu do innych
         data.id = playerId;
         broadcast(data, playerId);
         return;
@@ -104,13 +101,13 @@ wss.on('connection', (ws) => {
   });
 
   ws.on('close', () => {
-    console.log(`Gracz opuścił grę z ID: ${playerId}`);
+    console.log(`[SERVER] Gracz opuścił grę z ID: ${playerId}`);
     players.delete(playerId);
     broadcast({ type: 'playerLeft', id: playerId });
   });
 
   ws.on('error', (error) => {
-    console.error(`Błąd WebSocket dla gracza ${playerId}:`, error);
+    console.error(`[SERVER ERROR] Błąd WebSocket dla gracza ${playerId}:`, error);
   });
 });
 
@@ -122,14 +119,10 @@ server.listen(port, () => {
     setInterval(() => {
       console.log('Pinging self to prevent sleep...');
       https.get(`${RENDER_URL}/ping`, (res) => {
-        if (res.statusCode === 200) {
-          console.log('Ping successful!');
-        } else {
-          console.error(`Ping failed with status code: ${res.statusCode}`);
-        }
+        res.statusCode === 200 ? console.log('Ping successful!') : console.error(`Ping failed: ${res.statusCode}`);
       }).on('error', (err) => {
         console.error('Error during self-ping:', err.message);
       });
-    }, 840000); // 14 minut
+    }, 840000);
   }
 });
