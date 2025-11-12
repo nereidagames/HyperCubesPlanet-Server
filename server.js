@@ -9,6 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// Struktura gracza: { ws, nickname, position, quaternion }
 const players = new Map();
 
 app.get('/ping', (req, res) => {
@@ -26,38 +27,29 @@ function broadcast(message, excludePlayerId = null) {
 
 wss.on('connection', (ws) => {
   const playerId = crypto.randomUUID();
-  console.log(`Gracz dołączył z ID: ${playerId}`);
+  console.log(`Gracz połączył się z ID: ${playerId}`);
   
-  const playerData = { 
+  // Zapisujemy gracza, ale jeszcze bez nicku (nie jest "gotowy")
+  players.set(playerId, { 
     ws: ws, 
-    nickname: `Player_${playerId.substring(0, 4)}`, // Domyślny nick od razu
+    nickname: null,
     position: { x: 0, y: 0.9, z: 0 },
     quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }
-  };
-  players.set(playerId, playerData);
+  });
 
   // 1. Witamy nowego gracza
   ws.send(JSON.stringify({ type: 'welcome', id: playerId }));
   
-  // 2. Wysyłamy nowemu graczowi listę wszystkich, którzy już są w grze
+  // 2. Wysyłamy nowemu graczowi listę tych, którzy już są w pełni w grze
   const existingPlayers = [];
   players.forEach((pd, id) => {
-    if (id !== playerId) { 
+    if (id !== playerId && pd.nickname) { // Wysyłaj tylko "gotowych" graczy
       existingPlayers.push({ id, nickname: pd.nickname, position: pd.position, quaternion: pd.quaternion });
     }
   });
   if (existingPlayers.length > 0) {
       ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
   }
-
-  // 3. Natychmiast informujemy wszystkich pozostałych, że nowy gracz dołączył (z domyślnym nickiem)
-  broadcast({ 
-      type: 'playerJoined', 
-      id: playerId, 
-      nickname: playerData.nickname,
-      position: playerData.position,
-      quaternion: playerData.quaternion
-  }, playerId);
 
   ws.on('message', (message) => {
     try {
@@ -67,28 +59,34 @@ wss.on('connection', (ws) => {
 
       if (data.type === 'setNickname') {
         currentPlayer.nickname = data.nickname;
-        console.log(`Gracz ${playerId} zaktualizował nick na: ${data.nickname}`);
-        // Informujemy wszystkich o aktualizacji nicku
-        broadcast({ type: 'updateNickname', id: playerId, nickname: data.nickname });
+        console.log(`Gracz ${playerId} jest gotowy z nickiem: ${data.nickname}`);
+        // TERAZ jest gotowy. Informujemy wszystkich pozostałych.
+        broadcast({ 
+            type: 'playerJoined', 
+            id: playerId, 
+            nickname: data.nickname,
+            position: currentPlayer.position,
+            quaternion: currentPlayer.quaternion
+        }, playerId);
         return;
       }
 
       if (data.type === 'chatMessage') {
-        broadcast({
-          type: 'chatMessage',
-          id: playerId,
-          nickname: currentPlayer.nickname,
-          text: data.text
-        });
+        if (currentPlayer.nickname) {
+          broadcast({
+            type: 'chatMessage', id: playerId, nickname: currentPlayer.nickname, text: data.text
+          });
+        }
         return;
       }
       
       if (data.type === 'playerMove') {
-        currentPlayer.position = data.position;
-        currentPlayer.quaternion = data.quaternion;
-        
-        data.id = playerId;
-        broadcast(data, playerId);
+        if (currentPlayer.nickname) { // Wysyłaj pozycję tylko jeśli gracz jest w pełni dołączony
+          currentPlayer.position = data.position;
+          currentPlayer.quaternion = data.quaternion;
+          data.id = playerId;
+          broadcast(data, playerId);
+        }
         return;
       }
 
@@ -114,11 +112,8 @@ server.listen(port, () => {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
   if (RENDER_URL) {
     setInterval(() => {
-      console.log('Pinging self to prevent sleep...');
-      https.get(`${RENDER_URL}/ping`, (res) => {
-        res.statusCode === 200 ? console.log('Ping successful!') : console.error(`Ping failed: ${res.statusCode}`);
-      }).on('error', (err) => {
-        console.error('Error during self-ping:', err.message);
+      https.get(`${RENDER_URL}/ping`).on('error', (err) => {
+        console.error('Błąd pingu:', err.message);
       });
     }, 840000);
   }
