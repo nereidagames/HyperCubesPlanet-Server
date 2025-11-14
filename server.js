@@ -9,7 +9,7 @@ const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Struktura gracza: { ws, nickname, position, quaternion }
+// Struktura gracza: { ws, nickname, skinData, position, quaternion }
 const players = new Map();
 
 app.get('/ping', (req, res) => {
@@ -29,22 +29,20 @@ wss.on('connection', (ws) => {
   const playerId = crypto.randomUUID();
   console.log(`Gracz połączył się z ID: ${playerId}`);
   
-  // Zapisujemy gracza, ale jeszcze bez nicku (nie jest "gotowy")
   players.set(playerId, { 
     ws: ws, 
     nickname: null,
+    skinData: null, // Gracz zaczyna bez skina
     position: { x: 0, y: 0.9, z: 0 },
     quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }
   });
 
-  // 1. Witamy nowego gracza
   ws.send(JSON.stringify({ type: 'welcome', id: playerId }));
   
-  // 2. Wysyłamy nowemu graczowi listę tych, którzy już są w pełni w grze
   const existingPlayers = [];
   players.forEach((pd, id) => {
-    if (id !== playerId && pd.nickname) { // Wysyłaj tylko "gotowych" graczy
-      existingPlayers.push({ id, nickname: pd.nickname, position: pd.position, quaternion: pd.quaternion });
+    if (id !== playerId && pd.nickname) { 
+      existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion });
     }
   });
   if (existingPlayers.length > 0) {
@@ -57,14 +55,17 @@ wss.on('connection', (ws) => {
       const currentPlayer = players.get(playerId);
       if (!currentPlayer) return;
 
-      if (data.type === 'setNickname') {
+      // --- POPRAWKA: Zmieniamy 'setNickname' na 'playerReady', które przyjmuje też skin ---
+      if (data.type === 'playerReady') {
         currentPlayer.nickname = data.nickname;
+        currentPlayer.skinData = data.skinData; // Zapisujemy dane skina
         console.log(`Gracz ${playerId} jest gotowy z nickiem: ${data.nickname}`);
-        // TERAZ jest gotowy. Informujemy wszystkich pozostałych.
+        
         broadcast({ 
             type: 'playerJoined', 
             id: playerId, 
             nickname: data.nickname,
+            skinData: data.skinData, // Rozgłaszamy dane skina
             position: currentPlayer.position,
             quaternion: currentPlayer.quaternion
         }, playerId);
@@ -81,7 +82,7 @@ wss.on('connection', (ws) => {
       }
       
       if (data.type === 'playerMove') {
-        if (currentPlayer.nickname) { // Wysyłaj pozycję tylko jeśli gracz jest w pełni dołączony
+        if (currentPlayer.nickname) {
           currentPlayer.position = data.position;
           currentPlayer.quaternion = data.quaternion;
           data.id = playerId;
