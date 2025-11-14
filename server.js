@@ -4,7 +4,7 @@ const { WebSocketServer } = require('ws');
 const crypto = require('crypto');
 const https = require('https');
 
-const port = process.env.PORT || 8080;
+const port = process.env.PORT || 10000;
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -32,7 +32,7 @@ wss.on('connection', (ws) => {
   players.set(playerId, { 
     ws: ws, 
     nickname: null,
-    skinData: null, // Gracz zaczyna bez skina
+    skinData: null,
     position: { x: 0, y: 0.9, z: 0 },
     quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }
   });
@@ -55,17 +55,16 @@ wss.on('connection', (ws) => {
       const currentPlayer = players.get(playerId);
       if (!currentPlayer) return;
 
-      // --- POPRAWKA: Zmieniamy 'setNickname' na 'playerReady', które przyjmuje też skin ---
       if (data.type === 'playerReady') {
         currentPlayer.nickname = data.nickname;
-        currentPlayer.skinData = data.skinData; // Zapisujemy dane skina
+        currentPlayer.skinData = data.skinData;
         console.log(`Gracz ${playerId} jest gotowy z nickiem: ${data.nickname}`);
         
         broadcast({ 
             type: 'playerJoined', 
             id: playerId, 
             nickname: data.nickname,
-            skinData: data.skinData, // Rozgłaszamy dane skina
+            skinData: data.skinData,
             position: currentPlayer.position,
             quaternion: currentPlayer.quaternion
         }, playerId);
