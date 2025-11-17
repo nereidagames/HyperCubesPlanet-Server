@@ -2,7 +2,7 @@
   "name": "hypercubesplanet-server",
   "version": "1.0.0",
   "description": "",
-  "main": "index.js",
+  "main": "server.js",
   "engines": {
     "node": "18.x"
   },
@@ -13,7 +13,11 @@
   "author": "",
   "license": "ISC",
   "type": "commonjs",
-  "dependencies": { "bcrypt": "^5.1.1", "express": "^4.19.2", "jsonwebtoken": "^9.0.2", "pg": "^8.11.5", "ws": "^8.17.0" }
-  
+  "dependencies": {
+    "bcrypt": "^5.1.1",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "pg": "^8.11.5",
+    "ws": "^8.17.0"
   }
 }
