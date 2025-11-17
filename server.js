@@ -1,4 +1,3 @@
-// --- POPRAWKA: Przywracamy tę linię! Musi być na samym początku. ---
 require('dotenv').config();
 
 const express = require('express');
@@ -7,6 +6,7 @@ const { WebSocketServer } = require('ws');
 const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
+const https = require('https'); // Dodajemy na wszelki wypadek, jeśli nie było
 
 const port = process.env.PORT || 10000;
 const app = express();
@@ -22,6 +22,11 @@ const pool = new Pool({
 });
 
 const players = new Map();
+
+// --- POPRAWKA: Dodajemy trasę główną (root route) ---
+app.get('/', (req, res) => {
+  res.send('Serwer HyperCubesPlanet działa!');
+});
 
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
@@ -215,4 +220,21 @@ wss.on('connection', (ws, req) => {
 
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
+  
+  // --- POPRAWKA: Mechanizm "keep-alive" ---
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+  if (RENDER_URL) {
+    setInterval(() => {
+      console.log('Pinging self to prevent sleep...');
+      https.get(RENDER_URL, (res) => { // Pingujemy główny adres URL
+        if (res.statusCode === 200) {
+          console.log('Ping successful!');
+        } else {
+          console.error(`Ping failed with status code: ${res.statusCode}`);
+        }
+      }).on('error', (err) => {
+        console.error('Error during self-ping:', err.message);
+      });
+    }, 840000); // 14 minut
+  }
 });
