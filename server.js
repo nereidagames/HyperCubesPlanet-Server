@@ -20,6 +20,31 @@ const pool = new Pool({
 
 const players = new Map();
 
+// --- NOWOŚĆ: BEZPIECZNY ENDPOINT DO INICJALIZACJI BAZY DANYCH ---
+app.get('/api/init-database', async (req, res) => {
+  const providedKey = req.query.key;
+  if (!process.env.INIT_DB_SECRET_KEY || providedKey !== process.env.INIT_DB_SECRET_KEY) {
+    return res.status(403).send('Brak autoryzacji.');
+  }
+
+  const createTableQuery = `
+    CREATE TABLE IF NOT EXISTS users (
+      id SERIAL PRIMARY KEY,
+      username VARCHAR(50) UNIQUE NOT NULL,
+      password_hash VARCHAR(100) NOT NULL,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+
+  try {
+    await pool.query(createTableQuery);
+    res.status(200).send('Tabela "users" została pomyślnie sprawdzona/stworzona.');
+  } catch (err) {
+    console.error('Błąd podczas tworzenia tabeli:', err);
+    res.status(500).send('Wystąpił błąd serwera podczas tworzenia tabeli.');
+  }
+});
+
 // --- API HTTP DO REJESTRACJI I LOGOWANIA ---
 
 app.post('/api/register', async (req, res) => {
@@ -96,14 +121,12 @@ wss.on('connection', (ws, req) => {
     const token = url.searchParams.get('token');
 
     if (!token) {
-        console.log('Odrzucono połączenie: brak tokenu.');
         ws.close(1008, 'Brak tokenu uwierzytelniającego.');
         return;
     }
 
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) {
-            console.log('Odrzucono połączenie: nieprawidłowy token.');
             ws.close(1008, 'Nieprawidłowy token.');
             return;
         }
@@ -139,7 +162,6 @@ wss.on('connection', (ws, req) => {
                 if (!currentPlayer) return;
 
                 if (data.type === 'playerReady') {
-                    // Ta wiadomość jest teraz używana do aktualizacji skina
                     currentPlayer.skinData = data.skinData;
                     console.log(`Gracz ${playerId} zaktualizował skin.`);
                     
