@@ -1,23 +1,87 @@
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
-const crypto = require('crypto');
-const https = require('https');
+const { Pool } = require('pg');
+const bcrypt = require('bcrypt');
+const jwt = require('jsonwebtoken');
 
 const port = process.env.PORT || 10000;
 const app = express();
+app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Struktura gracza: { ws, nickname, skinData, position, quaternion }
-const players = new Map();
-
-// Endpoint używany przez "keep-alive service", aby zapobiec uśpieniu darmowej instancji na Render
-app.get('/ping', (req, res) => {
-  res.status(200).send('pong');
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: {
+    rejectUnauthorized: false
+  }
 });
 
-// Funkcja do wysyłania wiadomości do wszystkich graczy, z opcją wykluczenia jednego z nich
+const players = new Map();
+
+// --- API HTTP DO REJESTRACJI I LOGOWANIA ---
+
+app.post('/api/register', async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
+  }
+
+  try {
+    const salt = await bcrypt.genSalt(10);
+    const password_hash = await bcrypt.hash(password, salt);
+
+    const newUser = await pool.query(
+      'INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username',
+      [username, password_hash]
+    );
+
+    res.status(201).json({ user: newUser.rows[0], message: 'Konto zostało pomyślnie utworzone.' });
+  } catch (err) {
+    if (err.code === '23505') {
+      return res.status(409).json({ message: 'Ta nazwa użytkownika jest już zajęta.' });
+    }
+    console.error(err);
+    res.status(500).json({ message: 'Wystąpił błąd serwera.' });
+  }
+});
+
+app.post('/api/login', async (req, res) => {
+  const { username, password } = req.body;
+
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
+  }
+
+  try {
+    const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+    const user = result.rows[0];
+
+    if (!user) {
+      return res.status(404).json({ message: 'Użytkownik o takiej nazwie nie istnieje.' });
+    }
+
+    const isMatch = await bcrypt.compare(password, user.password_hash);
+
+    if (!isMatch) {
+      return res.status(401).json({ message: 'Nieprawidłowe hasło.' });
+    }
+
+    const payload = { userId: user.id, username: user.username };
+    const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
+
+    res.json({ token, user: { id: user.id, username: user.username } });
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Wystąpił błąd serwera.' });
+  }
+});
+
+// --- SERWER WEBSOCKET DO GRY ---
+
 function broadcast(message, excludePlayerId = null) {
   const messageStr = JSON.stringify(message);
   players.forEach((playerData, playerId) => {
@@ -27,117 +91,105 @@ function broadcast(message, excludePlayerId = null) {
   });
 }
 
-wss.on('connection', (ws) => {
-  const playerId = crypto.randomUUID();
-  console.log(`Gracz połączył się z ID: ${playerId}`);
-  
-  // Zapisujemy nowego gracza z jego domyślną pozycją startową
-  players.set(playerId, { 
-    ws: ws, 
-    nickname: null,
-    skinData: null,
-    // POPRAWKA KRYTYCZNA: Pozycja startowa Y została zmieniona z 0.9 na 0.1.
-    // Teraz idealnie pasuje do wysokości podłogi na kliencie (FLOOR_TOP_Y = 0.1),
-    // ponieważ punkt odniesienia modelu postaci (origin) jest teraz na jego stopach.
-    position: { x: 0, y: 0.1, z: 0 },
-    quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 }
-  });
+wss.on('connection', (ws, req) => {
+    const url = new URL(req.url, `http://${req.headers.host}`);
+    const token = url.searchParams.get('token');
 
-  // Wysyłamy nowemu graczowi jego unikalne ID
-  ws.send(JSON.stringify({ type: 'welcome', id: playerId }));
-  
-  // Przygotowujemy listę już istniejących graczy do wysłania nowemu graczowi
-  const existingPlayers = [];
-  players.forEach((pd, id) => {
-    // Upewniamy się, że nie wysyłamy gracza do samego siebie i że gracz jest już "gotowy" (ma nick)
-    if (id !== playerId && pd.nickname) { 
-      existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion });
+    if (!token) {
+        console.log('Odrzucono połączenie: brak tokenu.');
+        ws.close(1008, 'Brak tokenu uwierzytelniającego.');
+        return;
     }
-  });
-  // Jeśli są jacyś gracze, wysyłamy ich listę
-  if (existingPlayers.length > 0) {
-      ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
-  }
 
-  // Obsługa wiadomości od klienta
-  ws.on('message', (message) => {
-    try {
-      const data = JSON.parse(message);
-      const currentPlayer = players.get(playerId);
-      if (!currentPlayer) return;
+    jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+        if (err) {
+            console.log('Odrzucono połączenie: nieprawidłowy token.');
+            ws.close(1008, 'Nieprawidłowy token.');
+            return;
+        }
 
-      // Gracz wysyła tę wiadomość po wpisaniu nicku
-      if (data.type === 'playerReady') {
-        currentPlayer.nickname = data.nickname;
-        currentPlayer.skinData = data.skinData;
-        console.log(`Gracz ${playerId} jest gotowy z nickiem: ${data.nickname}`);
+        const playerId = decoded.userId;
+        const username = decoded.username;
+        console.log(`Gracz '${username}' (ID: ${playerId}) połączył się.`);
         
-        // Informujemy wszystkich INNYCH graczy, że dołączył nowy gracz
-        broadcast({ 
-            type: 'playerJoined', 
-            id: playerId, 
-            nickname: data.nickname,
-            skinData: data.skinData,
-            position: currentPlayer.position,
-            quaternion: currentPlayer.quaternion
-        }, playerId);
-        return;
-      }
+        players.set(playerId, { 
+            ws: ws, 
+            nickname: username, 
+            skinData: null, 
+            position: { x: 0, y: 0.9, z: 0 }, 
+            quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } 
+        });
 
-      // Gracz wysłał wiadomość na czacie
-      if (data.type === 'chatMessage') {
-        if (currentPlayer.nickname) {
-          // Rozsyłamy wiadomość do WSZYSTKICH (włącznie z nadawcą, aby miał potwierdzenie)
-          broadcast({
-            type: 'chatMessage', id: playerId, nickname: currentPlayer.nickname, text: data.text
-          });
+        ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
+
+        const existingPlayers = [];
+        players.forEach((pd, id) => {
+            if (id !== playerId && pd.nickname) { 
+                existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion });
+            }
+        });
+        if (existingPlayers.length > 0) {
+            ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
         }
-        return;
-      }
-      
-      // Gracz zaktualizował swoją pozycję
-      if (data.type === 'playerMove') {
-        if (currentPlayer.nickname) {
-          currentPlayer.position = data.position;
-          currentPlayer.quaternion = data.quaternion;
-          data.id = playerId; // Upewniamy się, że wiadomość zawiera ID gracza
-          // Wysyłamy aktualizację pozycji do wszystkich INNYCH graczy
-          broadcast(data, playerId);
-        }
-        return;
-      }
 
-    } catch (error) {
-      console.error('Błąd podczas parsowania wiadomości:', error);
-    }
-  });
+        ws.on('message', (message) => {
+            try {
+                const data = JSON.parse(message);
+                const currentPlayer = players.get(playerId);
+                if (!currentPlayer) return;
 
-  // Obsługa zamknięcia połączenia
-  ws.on('close', () => {
-    console.log(`Gracz opuścił grę z ID: ${playerId}`);
-    players.delete(playerId);
-    // Informujemy wszystkich, że ten gracz wyszedł
-    broadcast({ type: 'playerLeft', id: playerId });
-  });
+                if (data.type === 'playerReady') {
+                    // Ta wiadomość jest teraz używana do aktualizacji skina
+                    currentPlayer.skinData = data.skinData;
+                    console.log(`Gracz ${playerId} zaktualizował skin.`);
+                    
+                    broadcast({ 
+                        type: 'playerJoined', 
+                        id: playerId, 
+                        nickname: currentPlayer.nickname,
+                        skinData: data.skinData,
+                        position: currentPlayer.position,
+                        quaternion: currentPlayer.quaternion
+                    }, playerId);
+                    return;
+                }
 
-  // Obsługa błędów
-  ws.on('error', (error) => {
-    console.error(`Błąd WebSocket dla gracza ${playerId}:`, error);
-  });
+                if (data.type === 'chatMessage') {
+                    if (currentPlayer.nickname) {
+                        broadcast({
+                            type: 'chatMessage', id: playerId, nickname: currentPlayer.nickname, text: data.text
+                        });
+                    }
+                    return;
+                }
+                
+                if (data.type === 'playerMove') {
+                    if (currentPlayer.nickname) {
+                        currentPlayer.position = data.position;
+                        currentPlayer.quaternion = data.quaternion;
+                        data.id = playerId;
+                        broadcast(data, playerId);
+                    }
+                    return;
+                }
+
+            } catch (error) {
+                console.error('Błąd podczas parsowania wiadomości:', error);
+            }
+        });
+
+        ws.on('close', () => {
+            console.log(`Gracz opuścił grę z ID: ${playerId}`);
+            players.delete(playerId);
+            broadcast({ type: 'playerLeft', id: playerId });
+        });
+
+        ws.on('error', (error) => {
+            console.error(`Błąd WebSocket dla gracza ${playerId}:`, error);
+        });
+    });
 });
 
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
-  
-  // Utrzymywanie aktywności serwera na platformie Render
-  const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
-  if (RENDER_URL) {
-    // Pingujemy serwer co 14 minut, aby zapobiec jego uśpieniu
-    setInterval(() => {
-      console.log('Wysyłanie pingu, aby utrzymać serwer aktywnym...');
-      https.get(`${RENDER_URL}/ping`).on('error', (err) => {
-        console.error('Błąd pingu:', err.message);
-      });
-    }, 840000); 
-  }
 });
