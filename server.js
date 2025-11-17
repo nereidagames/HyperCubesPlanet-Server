@@ -1,3 +1,6 @@
+// --- POPRAWKA: Przywracamy tę linię! Musi być na samym początku. ---
+require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const { WebSocketServer } = require('ws');
@@ -11,7 +14,6 @@ app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Konfiguracja połączenia z bazą danych z obsługą SSL wymaganą przez Render
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -21,7 +23,6 @@ const pool = new Pool({
 
 const players = new Map();
 
-// --- ENDPOINT DO INICJALIZACJI BAZY DANYCH ---
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
   if (!process.env.INIT_DB_SECRET_KEY || providedKey !== process.env.INIT_DB_SECRET_KEY) {
@@ -38,7 +39,7 @@ app.get('/api/init-database', async (req, res) => {
   `;
 
   try {
-    await pool.query('SELECT NOW()'); // Test połączenia
+    await pool.query('SELECT NOW()');
     console.log('Połączenie z bazą danych udane.');
     
     await pool.query(createTableQuery);
@@ -49,7 +50,6 @@ app.get('/api/init-database', async (req, res) => {
   }
 });
 
-// --- API HTTP DO REJESTRACJI I LOGOWANIA ---
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
 
@@ -108,7 +108,6 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
-// --- SERWER WEBSOCKET DO GRY ---
 function broadcast(message, excludePlayerId = null) {
   const messageStr = JSON.stringify(message);
   players.forEach((playerData, playerId) => {
