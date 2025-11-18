@@ -29,6 +29,18 @@ const pool = new Pool({
 
 const players = new Map();
 
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token == null) return res.sendStatus(401);
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+};
+
 app.get('/', (req, res) => {
   res.send('Serwer HyperCubesPlanet działa!');
 });
@@ -44,6 +56,7 @@ app.get('/api/init-database', async (req, res) => {
       id SERIAL PRIMARY KEY,
       username VARCHAR(50) UNIQUE NOT NULL,
       password_hash VARCHAR(100) NOT NULL,
+      coins INTEGER DEFAULT 0 NOT NULL,
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
   `;
@@ -110,12 +123,42 @@ app.post('/api/login', async (req, res) => {
     const payload = { userId: user.id, username: user.username };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
 
-    res.json({ token, user: { id: user.id, username: user.username } });
+    res.json({ token, user: { id: user.id, username: user.username, coins: user.coins } });
 
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Wystąpił błąd serwera.' });
   }
+});
+
+app.post('/api/coins/update', authenticateToken, async (req, res) => {
+    const { amount } = req.body;
+    const userId = req.user.userId;
+
+    if (typeof amount !== 'number') {
+        return res.status(400).json({ message: 'Nieprawidłowa kwota.' });
+    }
+
+    try {
+        if (amount < 0) {
+            const currentBalanceResult = await pool.query('SELECT coins FROM users WHERE id = $1', [userId]);
+            if (currentBalanceResult.rows[0].coins < Math.abs(amount)) {
+                return res.status(403).json({ message: 'Niewystarczająca ilość monet.' });
+            }
+        }
+        
+        const result = await pool.query(
+            'UPDATE users SET coins = coins + $1 WHERE id = $2 RETURNING coins',
+            [amount, userId]
+        );
+        
+        const newBalance = result.rows[0].coins;
+        res.json({ newBalance });
+
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Błąd serwera podczas aktualizacji monet.' });
+    }
 });
 
 function broadcast(message, excludePlayerId = null) {
@@ -225,20 +268,4 @@ wss.on('connection', (ws, req) => {
 
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
-  
-  const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
-  if (RENDER_URL) {
-    setInterval(() => {
-      console.log('Pinging self to prevent sleep...');
-      https.get(RENDER_URL, (res) => {
-        if (res.statusCode === 200) {
-          console.log('Ping successful!');
-        } else {
-          console.error(`Ping failed with status code: ${res.statusCode}`);
-        }
-      }).on('error', (err) => {
-        console.error('Error during self-ping:', err.message);
-      });
-    }, 840000);
-  }
 });
