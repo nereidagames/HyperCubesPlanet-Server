@@ -7,27 +7,25 @@ const { Pool } = require('pg');
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const cors = require('cors');
+const https = require('https');
 
 const port = process.env.PORT || 10000;
 const app = express();
 
-const corsOptions = {
-  origin: 'https://nereidagames.github.io' 
-};
+const corsOptions = { origin: 'https://nereidagames.github.io' };
 app.use(cors(corsOptions));
-
 app.use(express.json());
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: {
-    rejectUnauthorized: false
-  }
+  ssl: { rejectUnauthorized: false }
 });
 
 const players = new Map();
+let currentCoin = null;
+const MAP_BOUNDS = 30;
 
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
@@ -41,9 +39,7 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-app.get('/', (req, res) => {
-  res.send('Serwer HyperCubesPlanet działa!');
-});
+app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
@@ -60,35 +56,28 @@ app.get('/api/init-database', async (req, res) => {
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
   `;
-
   try {
     await pool.query('SELECT NOW()');
     console.log('Połączenie z bazą danych udane.');
-    
     await pool.query(createTableQuery);
     res.status(200).send('Tabela "users" została pomyślnie sprawdzona/stworzona.');
   } catch (err) {
     console.error('Błąd podczas inicjalizacji bazy danych:', err);
-    res.status(500).send('Wystąpił błąd serwera podczas tworzenia tabeli. Sprawdź logi serwera na Render.com.');
+    res.status(500).send('Wystąpił błąd serwera podczas tworzenia tabeli.');
   }
 });
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
-  }
+  if (!username || !password) return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
 
   try {
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
-
     const newUser = await pool.query(
       'INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username',
       [username, password_hash]
     );
-
     res.status(201).json({ user: newUser.rows[0], message: 'Konto zostało pomyślnie utworzone.' });
   } catch (err) {
     if (err.code === '23505') {
@@ -101,30 +90,20 @@ app.post('/api/register', async (req, res) => {
 
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
-
-  if (!username || !password) {
-    return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
-  }
+  if (!username || !password) return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
 
   try {
     const result = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     const user = result.rows[0];
-
-    if (!user) {
-      return res.status(404).json({ message: 'Użytkownik o takiej nazwie nie istnieje.' });
-    }
-
+    if (!user) return res.status(404).json({ message: 'Użytkownik o takiej nazwie nie istnieje.' });
+    
     const isMatch = await bcrypt.compare(password, user.password_hash);
-
-    if (!isMatch) {
-      return res.status(401).json({ message: 'Nieprawidłowe hasło.' });
-    }
+    if (!isMatch) return res.status(401).json({ message: 'Nieprawidłowe hasło.' });
 
     const payload = { userId: user.id, username: user.username };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
 
     res.json({ token, user: { id: user.id, username: user.username, coins: user.coins } });
-
   } catch (err) {
     console.error(err);
     res.status(500).json({ message: 'Wystąpił błąd serwera.' });
@@ -135,9 +114,7 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => {
     const { amount } = req.body;
     const userId = req.user.userId;
 
-    if (typeof amount !== 'number') {
-        return res.status(400).json({ message: 'Nieprawidłowa kwota.' });
-    }
+    if (typeof amount !== 'number') return res.status(400).json({ message: 'Nieprawidłowa kwota.' });
 
     try {
         if (amount < 0) {
@@ -170,6 +147,19 @@ function broadcast(message, excludePlayerId = null) {
   });
 }
 
+function spawnCoin() {
+    if (currentCoin) return;
+
+    const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
+    const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
+    currentCoin = {
+        position: { x, y: 1, z }
+    };
+    
+    console.log(`Serwer stworzył monetę w: x=${x.toFixed(1)}, z=${z.toFixed(1)}`);
+    broadcast({ type: 'coinSpawned', position: currentCoin.position });
+}
+
 wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get('token');
@@ -189,13 +179,7 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`Gracz '${username}' (ID: ${playerId}) połączył się.`);
         
-        players.set(playerId, { 
-            ws: ws, 
-            nickname: username, 
-            skinData: null, 
-            position: { x: 0, y: 0.9, z: 0 }, 
-            quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } 
-        });
+        players.set(playerId, { ws, nickname: username, skinData: null, position: { x: 0, y: 0.9, z: 0 }, quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } });
 
         ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
 
@@ -209,7 +193,11 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
         }
 
-        ws.on('message', (message) => {
+        if (currentCoin) {
+            ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
+        }
+
+        ws.on('message', async (message) => {
             try {
                 const data = JSON.parse(message);
                 const currentPlayer = players.get(playerId);
@@ -217,8 +205,6 @@ wss.on('connection', (ws, req) => {
 
                 if (data.type === 'playerReady') {
                     currentPlayer.skinData = data.skinData;
-                    console.log(`Gracz ${playerId} zaktualizował skin.`);
-                    
                     broadcast({ 
                         type: 'playerJoined', 
                         id: playerId, 
@@ -249,6 +235,27 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
+                if (data.type === 'collectCoin') {
+                    if (currentCoin) {
+                        console.log(`Gracz ${username} zbiera monetę.`);
+                        currentCoin = null;
+
+                        broadcast({ type: 'coinCollected' });
+
+                        const result = await pool.query(
+                            'UPDATE users SET coins = coins + $1 WHERE id = $2 RETURNING coins',
+                            [200, playerId]
+                        );
+                        
+                        if (result.rows.length > 0) {
+                            ws.send(JSON.stringify({ type: 'updateBalance', newBalance: result.rows[0].coins }));
+                        }
+
+                        setTimeout(spawnCoin, 5000);
+                    }
+                    return;
+                }
+
             } catch (error) {
                 console.error('Błąd podczas parsowania wiadomości:', error);
             }
@@ -268,4 +275,22 @@ wss.on('connection', (ws, req) => {
 
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
+  
+  setTimeout(spawnCoin, 10000);
+  
+  const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
+  if (RENDER_URL) {
+    setInterval(() => {
+      console.log('Pinging self to prevent sleep...');
+      https.get(RENDER_URL, (res) => {
+        if (res.statusCode === 200) {
+          console.log('Ping successful!');
+        } else {
+          console.error(`Ping failed with status code: ${res.statusCode}`);
+        }
+      }).on('error', (err) => {
+        console.error('Error during self-ping:', err.message);
+      });
+    }, 840000);
+  }
 });
