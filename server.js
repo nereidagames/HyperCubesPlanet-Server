@@ -47,7 +47,7 @@ app.get('/api/init-database', async (req, res) => {
     return res.status(403).send('Brak autoryzacji.');
   }
 
-  const createTableQuery = `
+  const createUsersTableQuery = `
     CREATE TABLE IF NOT EXISTS users (
       id SERIAL PRIMARY KEY,
       username VARCHAR(50) UNIQUE NOT NULL,
@@ -56,14 +56,24 @@ app.get('/api/init-database', async (req, res) => {
       created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
     );
   `;
+  const createMessagesTableQuery = `
+    CREATE TABLE IF NOT EXISTS private_messages (
+      id SERIAL PRIMARY KEY,
+      sender_id INTEGER REFERENCES users(id) NOT NULL,
+      recipient_id INTEGER REFERENCES users(id) NOT NULL,
+      message_text TEXT NOT NULL,
+      is_read BOOLEAN DEFAULT false,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );
+  `;
+
   try {
-    await pool.query('SELECT NOW()');
-    console.log('Połączenie z bazą danych udane.');
-    await pool.query(createTableQuery);
-    res.status(200).send('Tabela "users" została pomyślnie sprawdzona/stworzona.');
+    await pool.query(createUsersTableQuery);
+    await pool.query(createMessagesTableQuery);
+    res.status(200).send('Tabele "users" i "private_messages" zostały pomyślnie sprawdzone/stworzone.');
   } catch (err) {
     console.error('Błąd podczas inicjalizacji bazy danych:', err);
-    res.status(500).send('Wystąpił błąd serwera podczas tworzenia tabeli.');
+    res.status(500).send('Wystąpił błąd serwera podczas tworzenia tabel.');
   }
 });
 
@@ -80,9 +90,7 @@ app.post('/api/register', async (req, res) => {
     );
     res.status(201).json({ user: newUser.rows[0], message: 'Konto zostało pomyślnie utworzone.' });
   } catch (err) {
-    if (err.code === '23505') {
-      return res.status(409).json({ message: 'Ta nazwa użytkownika jest już zajęta.' });
-    }
+    if (err.code === '23505') return res.status(409).json({ message: 'Ta nazwa użytkownika jest już zajęta.' });
     console.error(err);
     res.status(500).json({ message: 'Wystąpił błąd serwera.' });
   }
@@ -138,6 +146,57 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => {
     }
 });
 
+app.get('/api/messages', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query(
+            `SELECT DISTINCT ON (other_user_id) other_user_id, other_username, message_text, created_at
+             FROM (
+                SELECT
+                    CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END as other_user_id,
+                    m.message_text,
+                    m.created_at
+                FROM private_messages m
+                WHERE m.sender_id = $1 OR m.recipient_id = $1
+                ORDER BY m.created_at DESC
+             ) AS sub
+             JOIN users u ON u.id = sub.other_user_id
+             GROUP BY other_user_id, other_username, message_text, created_at
+             ORDER BY created_at DESC`, [userId]
+        );
+        // Powyższe zapytanie jest uproszczone, w produkcji wymagałoby optymalizacji
+        res.json(result.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Błąd serwera przy pobieraniu konwersacji.' });
+    }
+});
+
+app.get('/api/messages/:username', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    const otherUsername = req.params.username;
+    try {
+        const otherUserResult = await pool.query('SELECT id FROM users WHERE username = $1', [otherUsername]);
+        if (otherUserResult.rows.length === 0) {
+            return res.status(404).json({ message: 'Użytkownik nie znaleziony.' });
+        }
+        const otherUserId = otherUserResult.rows[0].id;
+
+        const messages = await pool.query(
+            `SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at
+             FROM private_messages m
+             JOIN users u ON m.sender_id = u.id
+             WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1)
+             ORDER BY m.created_at ASC`,
+            [userId, otherUserId]
+        );
+        res.json(messages.rows);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ message: 'Błąd serwera przy pobieraniu wiadomości.' });
+    }
+});
+
 function broadcast(message, excludePlayerId = null) {
   const messageStr = JSON.stringify(message);
   players.forEach((playerData, playerId) => {
@@ -149,14 +208,9 @@ function broadcast(message, excludePlayerId = null) {
 
 function spawnCoin() {
     if (currentCoin) return;
-
     const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
-    currentCoin = {
-        position: { x, y: 1, z }
-    };
-    
-    console.log(`Serwer stworzył monetę w: x=${x.toFixed(1)}, z=${z.toFixed(1)}`);
+    currentCoin = { position: { x, y: 1, z } };
     broadcast({ type: 'coinSpawned', position: currentCoin.position });
 }
 
@@ -164,16 +218,10 @@ wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get('token');
 
-    if (!token) {
-        ws.close(1008, 'Brak tokenu uwierzytelniającego.');
-        return;
-    }
+    if (!token) { ws.close(1008, 'Brak tokenu.'); return; }
 
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
-        if (err) {
-            ws.close(1008, 'Nieprawidłowy token.');
-            return;
-        }
+        if (err) { ws.close(1008, 'Nieprawidłowy token.'); return; }
 
         const playerId = decoded.userId;
         const username = decoded.username;
@@ -203,15 +251,38 @@ wss.on('connection', (ws, req) => {
                 const currentPlayer = players.get(playerId);
                 if (!currentPlayer) return;
 
+                if (data.type === 'sendPrivateMessage') {
+                    const recipientUsername = data.recipient;
+                    const messageText = data.text;
+
+                    const recipientResult = await pool.query('SELECT id FROM users WHERE username = $1', [recipientUsername]);
+                    if (recipientResult.rows.length === 0) {
+                        ws.send(JSON.stringify({ type: 'privateMessageError', message: 'Nie znaleziono takiego gracza.' }));
+                        return;
+                    }
+                    const recipientId = recipientResult.rows[0].id;
+                    
+                    await pool.query(
+                        'INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)',
+                        [playerId, recipientId, messageText]
+                    );
+
+                    const recipientData = players.get(recipientId);
+                    if (recipientData && recipientData.ws.readyState === recipientData.ws.OPEN) {
+                        recipientData.ws.send(JSON.stringify({
+                            type: 'privateMessageReceived',
+                            sender: { id: playerId, nickname: currentPlayer.nickname },
+                            text: messageText
+                        }));
+                    }
+                    return;
+                }
+
                 if (data.type === 'playerReady') {
                     currentPlayer.skinData = data.skinData;
                     broadcast({ 
-                        type: 'playerJoined', 
-                        id: playerId, 
-                        nickname: currentPlayer.nickname,
-                        skinData: data.skinData,
-                        position: currentPlayer.position,
-                        quaternion: currentPlayer.quaternion
+                        type: 'playerJoined', id: playerId, nickname: currentPlayer.nickname, skinData: data.skinData,
+                        position: currentPlayer.position, quaternion: currentPlayer.quaternion
                     }, playerId);
                     return;
                 }
@@ -237,20 +308,15 @@ wss.on('connection', (ws, req) => {
 
                 if (data.type === 'collectCoin') {
                     if (currentCoin) {
-                        console.log(`Gracz ${username} zbiera monetę.`);
                         currentCoin = null;
-
                         broadcast({ type: 'coinCollected' });
-
                         const result = await pool.query(
                             'UPDATE users SET coins = coins + $1 WHERE id = $2 RETURNING coins',
                             [200, playerId]
                         );
-                        
                         if (result.rows.length > 0) {
                             ws.send(JSON.stringify({ type: 'updateBalance', newBalance: result.rows[0].coins }));
                         }
-
                         setTimeout(spawnCoin, 5000);
                     }
                     return;
@@ -281,15 +347,8 @@ server.listen(port, () => {
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
   if (RENDER_URL) {
     setInterval(() => {
-      console.log('Pinging self to prevent sleep...');
-      https.get(RENDER_URL, (res) => {
-        if (res.statusCode === 200) {
-          console.log('Ping successful!');
-        } else {
-          console.error(`Ping failed with status code: ${res.statusCode}`);
-        }
-      }).on('error', (err) => {
-        console.error('Error during self-ping:', err.message);
+      https.get(RENDER_URL).on('error', (err) => {
+        console.error('Błąd pingu:', err.message);
       });
     }, 840000);
   }
