@@ -59,7 +59,10 @@ app.get('/api/init-database', async (req, res) => {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    // Upewnij się, że kolumny istnieją (dla starszych baz)
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`);
+    
     await pool.query(`
       CREATE TABLE IF NOT EXISTS friendships (
         id SERIAL PRIMARY KEY,
@@ -86,6 +89,8 @@ app.get('/api/init-database', async (req, res) => {
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
+
+// --- AUTH & USER ---
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
@@ -118,6 +123,23 @@ app.post('/api/login', async (req, res) => {
   } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
+// NOWY ENDPOINT: Pobieranie aktualnych danych użytkownika (monety, avatar)
+app.get('/api/user/me', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const result = await pool.query('SELECT id, username, coins, current_skin_thumbnail FROM users WHERE id = $1', [userId]);
+        if (result.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' });
+        
+        const u = result.rows[0];
+        res.json({ 
+            user: { id: u.id, username: u.username, coins: u.coins || 0 }, 
+            thumbnail: u.current_skin_thumbnail 
+        });
+    } catch (err) {
+        res.status(500).json({ message: 'Błąd serwera.' });
+    }
+});
+
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => {
     const { thumbnail } = req.body;
     const userId = req.user.userId;
@@ -128,6 +150,8 @@ app.post('/api/user/thumbnail', authenticateToken, async (req, res) => {
         res.sendStatus(200);
     } catch (err) { console.error(err); res.sendStatus(500); }
 });
+
+// --- SYSTEM ZNAJOMYCH ---
 
 app.post('/api/friends/search', authenticateToken, async (req, res) => {
     const { query } = req.body;
@@ -147,9 +171,11 @@ app.post('/api/friends/request', authenticateToken, async (req, res) => {
     if(userId === targetUserId) return res.status(400).json({message: "Nie możesz dodać siebie."});
     try {
         const check = await pool.query(`SELECT * FROM friendships WHERE (user_id1 = $1 AND user_id2 = $2) OR (user_id1 = $2 AND user_id2 = $1)`, [userId, targetUserId]);
-        if (check.rows.length > 0) return res.status(400).json({ message: 'Zaproszenie już istnieje.' });
+        if (check.rows.length > 0) return res.status(400).json({ message: 'Zaproszenie już istnieje lub jesteście znajomymi.' });
+        
         await pool.query(`INSERT INTO friendships (user_id1, user_id2, status) VALUES ($1, $2, 'pending')`, [userId, targetUserId]);
         res.json({ message: 'Wysłano zaproszenie.' });
+        
         const targetSocket = players.get(targetUserId);
         if (targetSocket && targetSocket.ws.readyState === 1) targetSocket.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username }));
     } catch (err) { res.status(500).json({ message: 'Błąd bazy.' }); }
@@ -159,18 +185,27 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     const { requestId } = req.body;
     const userId = req.user.userId;
     try {
+        // Upewniamy się, że status jest 'pending' I że jesteśmy odbiorcą (user_id2)
         const result = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [requestId, userId]);
-        if (result.rowCount === 0) return res.status(400).json({ message: 'Nie znaleziono zaproszenia.' });
+        
+        if (result.rowCount === 0) return res.status(400).json({ message: 'Nie znaleziono zaproszenia lub już zaakceptowane.' });
+        
         res.json({ message: 'Zaproszenie przyjęte.' });
+        
         const senderId = result.rows[0].user_id1;
         const senderSocket = players.get(senderId);
         if (senderSocket && senderSocket.ws.readyState === 1) {
             senderSocket.ws.send(JSON.stringify({ type: 'friendRequestAccepted', by: req.user.username }));
-            senderSocket.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
+            senderSocket.ws.send(JSON.stringify({ type: 'friendStatusChange' })); // Wymuś odświeżenie listy u nadawcy
         }
+        // Wymuś odświeżenie u odbiorcy (siebie)
         const mySocket = players.get(userId);
         if (mySocket) mySocket.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
-    } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
+        
+    } catch (err) { 
+        console.error(err); 
+        res.status(500).json({ message: 'Błąd serwera.' }); 
+    }
 });
 
 app.get('/api/friends', authenticateToken, async (req, res) => {
@@ -191,10 +226,13 @@ app.get('/api/friends', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ message: 'Błąd listy.' }); }
 });
 
+// --- MONETY I WIADOMOŚCI ---
+
 app.post('/api/coins/update', authenticateToken, async (req, res) => {
     const { amount } = req.body;
     const userId = req.user.userId;
     try {
+        // Używamy COALESCE, aby uniknąć problemów z NULL
         const result = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [amount, userId]);
         res.json({ newBalance: result.rows[0].coins });
     } catch (err) { res.status(500).json({ message: 'Błąd.' }); }
@@ -247,7 +285,6 @@ function spawnCoin() {
     const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     currentCoin = { position: { x, y: 1, z } };
     broadcast({ type: 'coinSpawned', position: currentCoin.position });
-    console.log(`Spawn monety: ${x.toFixed(1)}, ${z.toFixed(1)}`);
 }
 
 function notifyFriendsStatus(userId, isOnline) {
@@ -276,18 +313,13 @@ wss.on('connection', (ws, req) => {
         if (err) { ws.close(1008); return; }
         const playerId = decoded.userId;
         const username = decoded.username;
-        console.log(`Gracz ${username} (ID: ${playerId}) online.`);
-        
-        // Resetuj pozycję na start, żeby anti-cheat nie szalał
+        console.log(`Gracz ${username} dołączył.`);
         players.set(playerId, { ws, nickname: username, skinData: null, thumbnail: null, position: { x: 0, y: 0.9, z: 0 }, quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } });
-        
         notifyFriendsStatus(playerId, true);
         ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
-        
         const existingPlayers = [];
         players.forEach((pd, id) => { if (id !== playerId) existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion }); });
         ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
-        
         if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
 
         ws.on('message', async (message) => {
@@ -295,54 +327,26 @@ wss.on('connection', (ws, req) => {
                 const data = JSON.parse(message);
                 const currentPlayer = players.get(playerId);
                 if (!currentPlayer) return;
-
-                if (data.type === 'sendPrivateMessage') { /* (kod bez zmian) */ }
+                if (data.type === 'sendPrivateMessage') { /* obsłużone wyżej w kodzie */ }
                 if (data.type === 'playerReady') {
                     currentPlayer.skinData = data.skinData;
                     broadcast({ type: 'playerJoined', id: playerId, nickname: currentPlayer.nickname, skinData: data.skinData, position: currentPlayer.position, quaternion: currentPlayer.quaternion }, playerId);
                 }
                 if (data.type === 'chatMessage') broadcast({ type: 'chatMessage', id: playerId, nickname: currentPlayer.nickname, text: data.text });
-                
-                // AKTUALIZACJA POZYCJI (Kluczowe dla anti-cheat)
                 if (data.type === 'playerMove') {
                     currentPlayer.position = data.position;
                     currentPlayer.quaternion = data.quaternion;
                     data.id = playerId;
                     broadcast(data, playerId);
                 }
-
-                // --- ZBIERANIE MONET ---
                 if (data.type === 'collectCoin') {
                     if (currentCoin) {
                         const dx = currentPlayer.position.x - currentCoin.position.x;
                         const dz = currentPlayer.position.z - currentCoin.position.z;
-                        const dist = Math.sqrt(dx*dx + dz*dz);
-                        
-                        // Logowanie dla debugowania
-                        console.log(`Gracz ${currentPlayer.nickname} chce zebrać. Dystans: ${dist.toFixed(2)}`);
-
-                        // Zwiększona tolerancja do 8.0
-                        if (dist > 8.0) {
-                            console.log("Anti-cheat: Zbyt daleko!");
-                            return;
-                        }
-
+                        if (Math.sqrt(dx*dx + dz*dz) > 8.0) return; // Zwiększona tolerancja
                         currentCoin = null;
                         broadcast({ type: 'coinCollected' });
-                        
-                        try {
-                            // Bezpieczne dodawanie monet (COALESCE)
-                            const result = await pool.query(
-                                'UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', 
-                                [200, playerId]
-                            );
-                            if(result.rows.length > 0) {
-                                ws.send(JSON.stringify({ type: 'updateBalance', newBalance: result.rows[0].coins }));
-                            }
-                        } catch(e) {
-                            console.error("Błąd DB monety:", e);
-                        }
-                        
+                        try { await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [200, playerId]); } catch(e) {}
                         setTimeout(spawnCoin, 5000);
                     }
                 }
