@@ -12,21 +12,26 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
+// Konfiguracja CORS - pozwalamy na połączenia z Twojej strony GitHub Pages
 const corsOptions = { origin: 'https://nereidagames.github.io' };
 app.use(cors(corsOptions));
 app.use(express.json());
+
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
+// Połączenie z bazą danych PostgreSQL
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: { rejectUnauthorized: false }
 });
 
+// Stan gry w pamięci serwera
 const players = new Map();
 let currentCoin = null;
-const MAP_BOUNDS = 30; // Granice spawnowania monet
+const MAP_BOUNDS = 30; // Granice, w których spawnują się monety
 
+// Middleware autentykacji JWT dla zapytań HTTP
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -41,7 +46,9 @@ const authenticateToken = (req, res, next) => {
 
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
-// Endpoint do inicjalizacji bazy danych (zabezpieczony kluczem)
+// --- Endpointy HTTP ---
+
+// Inicjalizacja bazy danych (zabezpieczona kluczem)
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
   if (!process.env.INIT_DB_SECRET_KEY || providedKey !== process.env.INIT_DB_SECRET_KEY) {
@@ -78,6 +85,7 @@ app.get('/api/init-database', async (req, res) => {
   }
 });
 
+// Rejestracja użytkownika
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
@@ -97,6 +105,7 @@ app.post('/api/register', async (req, res) => {
   }
 });
 
+// Logowanie użytkownika
 app.post('/api/login', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'Nazwa użytkownika i hasło są wymagane.' });
@@ -119,6 +128,7 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// Aktualizacja monet (np. zakupy w sklepie)
 app.post('/api/coins/update', authenticateToken, async (req, res) => {
     const { amount } = req.body;
     const userId = req.user.userId;
@@ -147,6 +157,7 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => {
     }
 });
 
+// Pobieranie listy konwersacji (ostatnie wiadomości)
 app.get('/api/messages', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
@@ -172,6 +183,7 @@ app.get('/api/messages', authenticateToken, async (req, res) => {
     }
 });
 
+// Pobieranie historii czatu z konkretnym użytkownikiem
 app.get('/api/messages/:username', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const otherUsername = req.params.username;
@@ -197,6 +209,7 @@ app.get('/api/messages/:username', authenticateToken, async (req, res) => {
     }
 });
 
+// Funkcja rozsyłająca wiadomości do wszystkich podłączonych graczy
 function broadcast(message, excludePlayerId = null) {
   const messageStr = JSON.stringify(message);
   players.forEach((playerData, playerId) => {
@@ -206,6 +219,7 @@ function broadcast(message, excludePlayerId = null) {
   });
 }
 
+// Funkcja tworząca nową monetę na mapie
 function spawnCoin() {
     if (currentCoin) return;
     const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
@@ -215,7 +229,10 @@ function spawnCoin() {
     console.log(`Zrespiono monetę na: ${x.toFixed(2)}, ${z.toFixed(2)}`);
 }
 
+// --- Obsługa WebSocket ---
+
 wss.on('connection', (ws, req) => {
+    // Weryfikacja tokenu przy połączeniu WS
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get('token');
 
@@ -228,7 +245,7 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`Gracz '${username}' (ID: ${playerId}) połączył się.`);
         
-        // Przechowujemy stan gracza na serwerze
+        // Zapisz gracza w pamięci
         players.set(playerId, { 
             ws, 
             nickname: username, 
@@ -237,8 +254,10 @@ wss.on('connection', (ws, req) => {
             quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } 
         });
 
+        // Wyślij powitanie i ID
         ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
 
+        // Wyślij listę innych graczy do nowego
         const existingPlayers = [];
         players.forEach((pd, id) => {
             if (id !== playerId && pd.nickname) { 
@@ -249,20 +268,24 @@ wss.on('connection', (ws, req) => {
             ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
         }
 
+        // Jeśli jest moneta, wyślij jej pozycję
         if (currentCoin) {
             ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
         }
 
+        // Obsługa wiadomości od klienta
         ws.on('message', async (message) => {
             try {
                 const data = JSON.parse(message);
                 const currentPlayer = players.get(playerId);
                 if (!currentPlayer) return;
 
+                // --- PRYWATNE WIADOMOŚCI (POPRAWIONE) ---
                 if (data.type === 'sendPrivateMessage') {
                     const recipientUsername = data.recipient;
                     const messageText = data.text;
 
+                    // 1. Sprawdź czy odbiorca istnieje
                     const recipientResult = await pool.query('SELECT id FROM users WHERE username = $1', [recipientUsername]);
                     if (recipientResult.rows.length === 0) {
                         ws.send(JSON.stringify({ type: 'privateMessageError', message: 'Nie znaleziono takiego gracza.' }));
@@ -270,11 +293,13 @@ wss.on('connection', (ws, req) => {
                     }
                     const recipientId = recipientResult.rows[0].id;
                     
+                    // 2. Zapisz w bazie
                     await pool.query(
                         'INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)',
                         [playerId, recipientId, messageText]
                     );
 
+                    // 3. Wyślij do ODBIORCY (jeśli jest online)
                     const recipientData = players.get(recipientId);
                     if (recipientData && recipientData.ws.readyState === recipientData.ws.OPEN) {
                         recipientData.ws.send(JSON.stringify({
@@ -283,9 +308,18 @@ wss.on('connection', (ws, req) => {
                             text: messageText
                         }));
                     }
+
+                    // 4. Wyślij potwierdzenie do NADAWCY (Nowość - naprawia UI)
+                    ws.send(JSON.stringify({
+                        type: 'privateMessageSent',
+                        recipient: recipientUsername,
+                        text: messageText
+                    }));
+
                     return;
                 }
 
+                // Inicjalizacja gracza na scenie
                 if (data.type === 'playerReady') {
                     currentPlayer.skinData = data.skinData;
                     broadcast({ 
@@ -295,6 +329,7 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
 
+                // Czat globalny
                 if (data.type === 'chatMessage') {
                     if (currentPlayer.nickname) {
                         broadcast({
@@ -304,35 +339,35 @@ wss.on('connection', (ws, req) => {
                     return;
                 }
                 
+                // Ruch gracza
                 if (data.type === 'playerMove') {
                     if (currentPlayer.nickname) {
-                        // Aktualizuj pozycję gracza na serwerze - KLUCZOWE DLA ANTI-CHEATA
+                        // Aktualizacja pozycji na serwerze (dla anti-cheata)
                         currentPlayer.position = data.position;
                         currentPlayer.quaternion = data.quaternion;
                         
-                        // Prześlij ruch do innych
                         data.id = playerId;
                         broadcast(data, playerId);
                     }
                     return;
                 }
 
-                // --- ANTI-CHEAT I ZBIERANIE MONET ---
+                // --- ZBIERANIE MONET (ANTI-CHEAT) ---
                 if (data.type === 'collectCoin') {
                     if (currentCoin) {
-                        // 1. Oblicz dystans gracza do monety (Anti-Cheat)
+                        // 1. Oblicz dystans gracza do monety
                         const dx = currentPlayer.position.x - currentCoin.position.x;
-                        const dy = currentPlayer.position.y - currentCoin.position.y; // Opcjonalnie, jeśli moneta jest wysoko
+                        const dy = currentPlayer.position.y - currentCoin.position.y;
                         const dz = currentPlayer.position.z - currentCoin.position.z;
                         const distance = Math.sqrt(dx * dx + dy * dy + dz * dz);
 
-                        // Tolerancja 5 jednostek (moneta ma hit box, plus lag sieciowy)
+                        // Tolerancja 5 jednostek (uwzględnia lagi)
                         if (distance > 5.0) {
-                            console.warn(`Podejrzana próba zebrania monety przez ${currentPlayer.nickname}. Dystans: ${distance}`);
+                            console.warn(`Odrzucono zebranie monety przez ${currentPlayer.nickname}. Dystans: ${distance}`);
                             return;
                         }
 
-                        // 2. Usuń monetę natychmiast (zapobiega podwójnemu zebraniu)
+                        // 2. Usuń monetę natychmiast
                         currentCoin = null;
                         broadcast({ type: 'coinCollected' });
 
@@ -349,7 +384,7 @@ wss.on('connection', (ws, req) => {
                             console.error("Błąd bazy danych przy dodawaniu monet:", dbErr);
                         }
 
-                        // 4. Zaplanuj spawn nowej monety
+                        // 4. Zaplanuj spawn nowej
                         setTimeout(spawnCoin, 5000);
                     }
                     return;
@@ -375,15 +410,16 @@ wss.on('connection', (ws, req) => {
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
   
+  // Pierwsza moneta po starcie serwera
   setTimeout(spawnCoin, 10000);
   
-  // Pingowanie serwera Render, żeby nie zasnął
+  // Mechanizm Keep-Alive dla Render.com
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
   if (RENDER_URL) {
     setInterval(() => {
       https.get(RENDER_URL).on('error', (err) => {
         console.error('Błąd pingu:', err.message);
       });
-    }, 840000);
+    }, 840000); // Co 14 minut
   }
 });
