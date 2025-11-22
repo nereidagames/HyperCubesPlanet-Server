@@ -42,7 +42,6 @@ const authenticateToken = (req, res, next) => {
 
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
-// --- WAŻNE: NAPRAWIONA INICJALIZACJA BAZY ---
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
   if (!process.env.INIT_DB_SECRET_KEY || providedKey !== process.env.INIT_DB_SECRET_KEY) {
@@ -50,23 +49,17 @@ app.get('/api/init-database', async (req, res) => {
   }
 
   try {
-    // 1. Tabela Users
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
         username VARCHAR(50) UNIQUE NOT NULL,
         password_hash VARCHAR(100) NOT NULL,
         coins INTEGER DEFAULT 0 NOT NULL,
+        current_skin_thumbnail TEXT,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
-
-    // 2. Dodanie kolumny miniaturki (jeśli nie istnieje - dla starych baz)
-    await pool.query(`
-      ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;
-    `);
-    
-    // 3. Tabela Friendships
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
     await pool.query(`
       CREATE TABLE IF NOT EXISTS friendships (
         id SERIAL PRIMARY KEY,
@@ -77,8 +70,6 @@ app.get('/api/init-database', async (req, res) => {
         UNIQUE(user_id1, user_id2)
       );
     `);
-
-    // 4. Tabela Messages
     await pool.query(`
       CREATE TABLE IF NOT EXISTS private_messages (
         id SERIAL PRIMARY KEY,
@@ -89,15 +80,12 @@ app.get('/api/init-database', async (req, res) => {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
-
-    res.status(200).send('Baza danych naprawiona i zaktualizowana pomyślnie.');
+    res.status(200).send('Baza danych OK.');
   } catch (err) {
-    console.error('Błąd inicjalizacji DB:', err);
+    console.error(err);
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
-
-// --- RESTZTA KODU BEZ ZMIAN ---
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
@@ -106,7 +94,7 @@ app.post('/api/register', async (req, res) => {
     const salt = await bcrypt.genSalt(10);
     const password_hash = await bcrypt.hash(password, salt);
     const newUser = await pool.query(
-      'INSERT INTO users (username, password_hash) VALUES ($1, $2) RETURNING id, username',
+      'INSERT INTO users (username, password_hash, coins) VALUES ($1, $2, 0) RETURNING id, username',
       [username, password_hash]
     );
     res.status(201).json({ user: newUser.rows[0], message: 'Konto utworzone.' });
@@ -126,7 +114,7 @@ app.post('/api/login', async (req, res) => {
     if (!isMatch) return res.status(401).json({ message: 'Złe hasło.' });
     const payload = { userId: user.id, username: user.username };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: user.id, username: user.username, coins: user.coins }, thumbnail: user.current_skin_thumbnail });
+    res.json({ token, user: { id: user.id, username: user.username, coins: user.coins || 0 }, thumbnail: user.current_skin_thumbnail });
   } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
@@ -150,7 +138,7 @@ app.post('/api/friends/search', authenticateToken, async (req, res) => {
             [`%${query}%`, userId]
         );
         res.json(result.rows);
-    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd szukania.' }); }
+    } catch (err) { res.status(500).json({ message: 'Błąd szukania.' }); }
 });
 
 app.post('/api/friends/request', authenticateToken, async (req, res) => {
@@ -164,7 +152,7 @@ app.post('/api/friends/request', authenticateToken, async (req, res) => {
         res.json({ message: 'Wysłano zaproszenie.' });
         const targetSocket = players.get(targetUserId);
         if (targetSocket && targetSocket.ws.readyState === 1) targetSocket.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username }));
-    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd bazy.' }); }
+    } catch (err) { res.status(500).json({ message: 'Błąd bazy.' }); }
 });
 
 app.post('/api/friends/accept', authenticateToken, async (req, res) => {
@@ -182,7 +170,7 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
         }
         const mySocket = players.get(userId);
         if (mySocket) mySocket.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
-    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd serwera.' }); }
+    } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
 app.get('/api/friends', authenticateToken, async (req, res) => {
@@ -200,14 +188,14 @@ app.get('/api/friends', authenticateToken, async (req, res) => {
         );
         const friends = friendsQuery.rows.map(f => ({ ...f, isOnline: players.has(f.id) }));
         res.json({ friends, requests: requestsQuery.rows });
-    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd listy.' }); }
+    } catch (err) { res.status(500).json({ message: 'Błąd listy.' }); }
 });
 
 app.post('/api/coins/update', authenticateToken, async (req, res) => {
     const { amount } = req.body;
     const userId = req.user.userId;
     try {
-        const result = await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2 RETURNING coins', [amount, userId]);
+        const result = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [amount, userId]);
         res.json({ newBalance: result.rows[0].coins });
     } catch (err) { res.status(500).json({ message: 'Błąd.' }); }
 });
@@ -259,6 +247,7 @@ function spawnCoin() {
     const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     currentCoin = { position: { x, y: 1, z } };
     broadcast({ type: 'coinSpawned', position: currentCoin.position });
+    console.log(`Spawn monety: ${x.toFixed(1)}, ${z.toFixed(1)}`);
 }
 
 function notifyFriendsStatus(userId, isOnline) {
@@ -287,13 +276,18 @@ wss.on('connection', (ws, req) => {
         if (err) { ws.close(1008); return; }
         const playerId = decoded.userId;
         const username = decoded.username;
-        console.log(`Gracz ${username} dołączył.`);
+        console.log(`Gracz ${username} (ID: ${playerId}) online.`);
+        
+        // Resetuj pozycję na start, żeby anti-cheat nie szalał
         players.set(playerId, { ws, nickname: username, skinData: null, thumbnail: null, position: { x: 0, y: 0.9, z: 0 }, quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } });
+        
         notifyFriendsStatus(playerId, true);
         ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
+        
         const existingPlayers = [];
         players.forEach((pd, id) => { if (id !== playerId) existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion }); });
         ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
+        
         if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
 
         ws.on('message', async (message) => {
@@ -301,26 +295,54 @@ wss.on('connection', (ws, req) => {
                 const data = JSON.parse(message);
                 const currentPlayer = players.get(playerId);
                 if (!currentPlayer) return;
-                if (data.type === 'sendPrivateMessage') { /* logic handled above */ }
+
+                if (data.type === 'sendPrivateMessage') { /* (kod bez zmian) */ }
                 if (data.type === 'playerReady') {
                     currentPlayer.skinData = data.skinData;
                     broadcast({ type: 'playerJoined', id: playerId, nickname: currentPlayer.nickname, skinData: data.skinData, position: currentPlayer.position, quaternion: currentPlayer.quaternion }, playerId);
                 }
                 if (data.type === 'chatMessage') broadcast({ type: 'chatMessage', id: playerId, nickname: currentPlayer.nickname, text: data.text });
+                
+                // AKTUALIZACJA POZYCJI (Kluczowe dla anti-cheat)
                 if (data.type === 'playerMove') {
                     currentPlayer.position = data.position;
                     currentPlayer.quaternion = data.quaternion;
                     data.id = playerId;
                     broadcast(data, playerId);
                 }
+
+                // --- ZBIERANIE MONET ---
                 if (data.type === 'collectCoin') {
                     if (currentCoin) {
                         const dx = currentPlayer.position.x - currentCoin.position.x;
                         const dz = currentPlayer.position.z - currentCoin.position.z;
-                        if (Math.sqrt(dx*dx + dz*dz) > 5.0) return;
+                        const dist = Math.sqrt(dx*dx + dz*dz);
+                        
+                        // Logowanie dla debugowania
+                        console.log(`Gracz ${currentPlayer.nickname} chce zebrać. Dystans: ${dist.toFixed(2)}`);
+
+                        // Zwiększona tolerancja do 8.0
+                        if (dist > 8.0) {
+                            console.log("Anti-cheat: Zbyt daleko!");
+                            return;
+                        }
+
                         currentCoin = null;
                         broadcast({ type: 'coinCollected' });
-                        try { await pool.query('UPDATE users SET coins = coins + $1 WHERE id = $2 RETURNING coins', [200, playerId]); } catch(e) {}
+                        
+                        try {
+                            // Bezpieczne dodawanie monet (COALESCE)
+                            const result = await pool.query(
+                                'UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', 
+                                [200, playerId]
+                            );
+                            if(result.rows.length > 0) {
+                                ws.send(JSON.stringify({ type: 'updateBalance', newBalance: result.rows[0].coins }));
+                            }
+                        } catch(e) {
+                            console.error("Błąd DB monety:", e);
+                        }
+                        
                         setTimeout(spawnCoin, 5000);
                     }
                 }
