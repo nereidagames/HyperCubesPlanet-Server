@@ -188,22 +188,36 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
+// --- WAŻNE: POPRAWIONE POBIERANIE LISTY ZNAJOMYCH ---
 app.get('/api/friends', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
+        // Poprawione zapytanie SQL: Łączymy się z tabelą users, wybierając ID TEJ DRUGIEJ osoby
         const friendsQuery = await pool.query(
             `SELECT u.id, u.username, u.current_skin_thumbnail
              FROM friendships f
-             JOIN users u ON (u.id = f.user_id1 OR u.id = f.user_id2)
-             WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted' AND u.id != $1`, [userId]
+             JOIN users u ON u.id = (
+                CASE
+                    WHEN f.user_id1 = $1 THEN f.user_id2
+                    ELSE f.user_id1
+                END
+             )
+             WHERE (f.user_id1 = $1 OR f.user_id2 = $1) 
+               AND f.status = 'accepted'`,
+            [userId]
         );
+        
         const requestsQuery = await pool.query(
             `SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail
              FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [userId]
         );
+        
         const friends = friendsQuery.rows.map(f => ({ ...f, isOnline: players.has(f.id) }));
         res.json({ friends, requests: requestsQuery.rows });
-    } catch (err) { res.status(500).json({ message: 'Błąd listy.' }); }
+    } catch (err) { 
+        console.error(err);
+        res.status(500).json({ message: 'Błąd listy.' }); 
+    }
 });
 
 app.post('/api/coins/update', authenticateToken, async (req, res) => {
@@ -322,39 +336,15 @@ wss.on('connection', (ws, req) => {
                     data.id = playerId;
                     broadcast(data, playerId);
                 }
-
-                // --- NAPRAWIONE ZBIERANIE MONET ---
                 if (data.type === 'collectCoin') {
                     if (currentCoin) {
                         const dx = currentPlayer.position.x - currentCoin.position.x;
                         const dz = currentPlayer.position.z - currentCoin.position.z;
-                        const dist = Math.sqrt(dx*dx + dz*dz);
-                        
-                        // Logowanie dystansu do debugowania
-                        console.log(`[DEBUG] ${username} próbuje zebrać monetę. Dystans: ${dist.toFixed(2)}`);
-
-                        // ZWIĘKSZONA TOLERANCJA DO 15.0 (żeby lagi nie blokowały)
-                        if (dist > 15.0) {
-                            console.log("[DEBUG] Odrzucono: za daleko.");
-                            return;
-                        }
-
+                        if (Math.sqrt(dx*dx + dz*dz) > 15.0) return; // Zwiększona tolerancja
                         currentCoin = null;
                         broadcast({ type: 'coinCollected' });
-                        
-                        try {
-                            // Użycie COALESCE dla bezpieczeństwa
-                            const result = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [200, playerId]);
-                            if(result.rows.length > 0) {
-                                ws.send(JSON.stringify({ type: 'updateBalance', newBalance: result.rows[0].coins }));
-                                console.log(`[DEBUG] Dodano monety dla ${username}. Nowy stan: ${result.rows[0].coins}`);
-                            }
-                        } catch(e) {
-                            console.error("[DEBUG] Błąd DB przy monetach:", e);
-                        }
+                        try { await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [200, playerId]); } catch(e) {}
                         setTimeout(spawnCoin, 5000);
-                    } else {
-                        console.log("[DEBUG] Odrzucono: Brak monety na serwerze (currentCoin is null).");
                     }
                 }
             } catch (error) {}
