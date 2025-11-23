@@ -14,7 +14,7 @@ const app = express();
 
 const corsOptions = { origin: 'https://nereidagames.github.io' };
 app.use(cors(corsOptions));
-app.use(express.json({ limit: '10mb' })); // Limit dla miniaturek
+app.use(express.json({ limit: '10mb' })); // WAŻNE DLA ZDJĘĆ
 
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
@@ -42,6 +42,7 @@ const authenticateToken = (req, res, next) => {
 
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
+// --- INICJALIZACJA BAZY ---
 app.get('/api/init-database', async (req, res) => {
   const providedKey = req.query.key;
   if (!process.env.INIT_DB_SECRET_KEY || providedKey !== process.env.INIT_DB_SECRET_KEY) {
@@ -49,7 +50,6 @@ app.get('/api/init-database', async (req, res) => {
   }
 
   try {
-    // Tabele użytkowników
     await pool.query(`
       CREATE TABLE IF NOT EXISTS users (
         id SERIAL PRIMARY KEY,
@@ -60,8 +60,10 @@ app.get('/api/init-database', async (req, res) => {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
     `);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
+    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`);
     
-    // NOWA TABELA: SKINY
+    // TABELA SKINÓW
     await pool.query(`
       CREATE TABLE IF NOT EXISTS skins (
         id SERIAL PRIMARY KEY,
@@ -73,7 +75,6 @@ app.get('/api/init-database', async (req, res) => {
       );
     `);
 
-    // Tabele przyjaciół i wiadomości
     await pool.query(`
       CREATE TABLE IF NOT EXISTS friendships (
         id SERIAL PRIMARY KEY,
@@ -84,6 +85,7 @@ app.get('/api/init-database', async (req, res) => {
         UNIQUE(user_id1, user_id2)
       );
     `);
+    
     await pool.query(`
       CREATE TABLE IF NOT EXISTS private_messages (
         id SERIAL PRIMARY KEY,
@@ -96,12 +98,12 @@ app.get('/api/init-database', async (req, res) => {
     `);
     res.status(200).send('Baza danych zaktualizowana (dodano skins).');
   } catch (err) {
-    console.error(err);
+    console.error("Init DB Error:", err);
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
 
-// --- AUTH --- (bez zmian)
+// --- AUTH ---
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
   if (!username || !password) return res.status(400).json({ message: 'Brak danych.' });
@@ -129,8 +131,7 @@ app.post('/api/login', async (req, res) => {
     if (!isMatch) return res.status(401).json({ message: 'Złe hasło.' });
     const payload = { userId: user.id, username: user.username };
     const token = jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: '7d' });
-    const coins = user.coins !== null ? user.coins : 0;
-    res.json({ token, user: { id: user.id, username: user.username, coins: coins }, thumbnail: user.current_skin_thumbnail });
+    res.json({ token, user: { id: user.id, username: user.username, coins: user.coins || 0 }, thumbnail: user.current_skin_thumbnail });
   } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
@@ -140,10 +141,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         const result = await pool.query('SELECT id, username, coins, current_skin_thumbnail FROM users WHERE id = $1', [userId]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' });
         const u = result.rows[0];
-        res.json({ 
-            user: { id: u.id, username: u.username, coins: u.coins || 0 }, 
-            thumbnail: u.current_skin_thumbnail 
-        });
+        res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0 }, thumbnail: u.current_skin_thumbnail });
     } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
@@ -158,30 +156,33 @@ app.post('/api/user/thumbnail', authenticateToken, async (req, res) => {
     } catch (err) { console.error(err); res.sendStatus(500); }
 });
 
-// --- SKINY (NOWE ENDPOINTY) ---
+// --- SKINY (Z LOGOWANIEM BŁĘDÓW) ---
 
-// Zapisz skina
 app.post('/api/skins', authenticateToken, async (req, res) => {
     const { name, blocks, thumbnail } = req.body;
     const userId = req.user.userId;
     
-    if (!name || !blocks) return res.status(400).json({ message: 'Brak danych skina.' });
+    console.log(`[SKIN] Próba zapisu skina '${name}' przez UserID: ${userId}`);
+
+    if (!name || !blocks) {
+        console.error("[SKIN] Brak nazwy lub bloków!");
+        return res.status(400).json({ message: 'Brak danych skina.' });
+    }
 
     try {
-        // Zapisujemy blocks jako JSONB
         const result = await pool.query(
             `INSERT INTO skins (owner_id, name, blocks_data, thumbnail) 
              VALUES ($1, $2, $3, $4) RETURNING id`,
             [userId, name, JSON.stringify(blocks), thumbnail]
         );
+        console.log(`[SKIN] Zapisano skina ID: ${result.rows[0].id}`);
         res.status(201).json({ message: 'Skin zapisany.', skinId: result.rows[0].id });
     } catch (err) {
-        console.error(err);
+        console.error("[SKIN] Błąd SQL przy zapisie:", err);
         res.status(500).json({ message: 'Błąd zapisu skina.' });
     }
 });
 
-// Pobierz MOJE skiny (bez bloków, tylko lista)
 app.get('/api/skins/mine', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
@@ -190,10 +191,9 @@ app.get('/api/skins/mine', authenticateToken, async (req, res) => {
             [userId]
         );
         res.json(result.rows);
-    } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
+    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
-// Pobierz WSZYSTKIE skiny (publiczne)
 app.get('/api/skins/all', authenticateToken, async (req, res) => {
     try {
         const result = await pool.query(
@@ -203,20 +203,42 @@ app.get('/api/skins/all', authenticateToken, async (req, res) => {
              ORDER BY s.created_at DESC LIMIT 50`
         );
         res.json(result.rows);
-    } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
+    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
-// Pobierz szczegóły skina (klocki) do założenia
 app.get('/api/skins/:id', authenticateToken, async (req, res) => {
     const skinId = req.params.id;
     try {
         const result = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [skinId]);
         if (result.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono skina.' });
-        res.json(result.rows[0].blocks_data); // Zwraca tablicę bloków
-    } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
+        res.json(result.rows[0].blocks_data);
+    } catch (err) { console.error(err); res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
-// --- PRZYJACIELE (bez zmian) ---
+// --- ZNAJOMI ---
+
+app.get('/api/friends', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const friendsQuery = await pool.query(
+            `SELECT u.id, u.username, u.current_skin_thumbnail
+             FROM friendships f
+             JOIN users u ON (
+                (f.user_id1 = $1 AND u.id = f.user_id2) OR 
+                (f.user_id2 = $1 AND u.id = f.user_id1)
+             )
+             WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`,
+            [userId]
+        );
+        const requestsQuery = await pool.query(
+            `SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail
+             FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [userId]
+        );
+        const friends = friendsQuery.rows.map(f => ({ ...f, isOnline: players.has(f.id) }));
+        res.json({ friends, requests: requestsQuery.rows });
+    } catch (err) { res.status(500).json({ message: 'Błąd listy.' }); }
+});
+
 app.post('/api/friends/search', authenticateToken, async (req, res) => {
     const { query } = req.body;
     const userId = req.user.userId;
@@ -228,7 +250,7 @@ app.post('/api/friends/search', authenticateToken, async (req, res) => {
         res.json(result.rows);
     } catch (err) { res.status(500).json({ message: 'Błąd szukania.' }); }
 });
-// ... (reszta endpointów przyjaciół taka sama jak w poprzedniej wersji, skopiuj je jeśli chcesz mieć pewność, ale powyższe zmiany są kluczowe)
+
 app.post('/api/friends/request', authenticateToken, async (req, res) => {
     const { targetUserId } = req.body;
     const userId = req.user.userId;
@@ -248,7 +270,7 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
         const result = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [requestId, userId]);
-        if (result.rowCount === 0) return res.status(400).json({ message: 'Nie znaleziono.' });
+        if (result.rowCount === 0) return res.status(400).json({ message: 'Nie znaleziono zaproszenia.' });
         res.json({ message: 'Zaproszenie przyjęte.' });
         const senderId = result.rows[0].user_id1;
         const senderSocket = players.get(senderId);
@@ -261,28 +283,8 @@ app.post('/api/friends/accept', authenticateToken, async (req, res) => {
     } catch (err) { res.status(500).json({ message: 'Błąd serwera.' }); }
 });
 
-app.get('/api/friends', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    try {
-        const friendsQuery = await pool.query(
-            `SELECT u.id, u.username, u.current_skin_thumbnail
-             FROM friendships f
-             JOIN users u ON (
-                (f.user_id1 = $1 AND u.id = f.user_id2) OR 
-                (f.user_id2 = $1 AND u.id = f.user_id1)
-             )
-             WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`, [userId]
-        );
-        const requestsQuery = await pool.query(
-            `SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail
-             FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [userId]
-        );
-        const friends = friendsQuery.rows.map(f => ({ ...f, isOnline: players.has(f.id) }));
-        res.json({ friends, requests: requestsQuery.rows });
-    } catch (err) { res.status(500).json({ message: 'Błąd listy.' }); }
-});
+// --- MONETY I WIADOMOŚCI ---
 
-// --- RESTZTA (MONETY, WIADOMOŚCI) BEZ ZMIAN ---
 app.post('/api/coins/update', authenticateToken, async (req, res) => {
     const { amount } = req.body;
     const userId = req.user.userId;
@@ -291,16 +293,21 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => {
         res.json({ newBalance: result.rows[0].coins });
     } catch (err) { res.status(500).json({ message: 'Błąd.' }); }
 });
+
 app.get('/api/messages', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     try {
         const result = await pool.query(
             `SELECT DISTINCT ON (other_user_id) other_user_id, other_username, message_text, created_at
-             FROM (SELECT CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END as other_user_id, m.message_text, m.created_at FROM private_messages m WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY m.created_at DESC) AS sub JOIN users u ON u.id = sub.other_user_id GROUP BY other_user_id, other_username, message_text, created_at ORDER BY created_at DESC`, [userId]
+             FROM (
+                SELECT CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END as other_user_id, m.message_text, m.created_at
+                FROM private_messages m WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY m.created_at DESC
+             ) AS sub JOIN users u ON u.id = sub.other_user_id GROUP BY other_user_id, other_username, message_text, created_at ORDER BY created_at DESC`, [userId]
         );
         res.json(result.rows);
     } catch (err) { res.status(500).json({ message: 'Błąd.' }); }
 });
+
 app.get('/api/messages/:username', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const otherUsername = req.params.username;
@@ -309,13 +316,14 @@ app.get('/api/messages/:username', authenticateToken, async (req, res) => {
         if (otherUserResult.rows.length === 0) return res.status(404).json({ message: 'Brak usera.' });
         const otherUserId = otherUserResult.rows[0].id;
         const messages = await pool.query(
-            `SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) ORDER BY m.created_at ASC`, [userId, otherUserId]
+            `SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at
+             FROM private_messages m JOIN users u ON m.sender_id = u.id
+             WHERE (sender_id = $1 AND recipient_id = $2) OR (sender_id = $2 AND recipient_id = $1) ORDER BY m.created_at ASC`, [userId, otherUserId]
         );
         res.json(messages.rows);
     } catch (err) { res.status(500).json({ message: 'Błąd.' }); }
 });
 
-// ... (reszta funkcji broadcast, spawnCoin, notifyFriends, wss.on - bez zmian z poprzedniej wersji)
 function broadcast(message, excludePlayerId = null) {
   const messageStr = JSON.stringify(message);
   players.forEach((playerData, playerId) => {
@@ -324,13 +332,16 @@ function broadcast(message, excludePlayerId = null) {
     }
   });
 }
+
 function spawnCoin() {
     if (currentCoin) return;
     const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     currentCoin = { position: { x, y: 1, z } };
     broadcast({ type: 'coinSpawned', position: currentCoin.position });
+    console.log(`Spawn monety: ${x.toFixed(1)}, ${z.toFixed(1)}`);
 }
+
 function notifyFriendsStatus(userId, isOnline) {
     (async () => {
         try {
@@ -347,14 +358,18 @@ function notifyFriendsStatus(userId, isOnline) {
         } catch (e) {}
     })();
 }
+
 wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`);
     const token = url.searchParams.get('token');
     if (!token) { ws.close(1008); return; }
+
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) { ws.close(1008); return; }
         const playerId = decoded.userId;
         const username = decoded.username;
+        console.log(`Gracz ${username} dołączył.`);
+        
         players.set(playerId, { ws, nickname: username, skinData: null, thumbnail: null, position: { x: 0, y: 0.9, z: 0 }, quaternion: { _x: 0, _y: 0, _z: 0, _w: 1 } });
         notifyFriendsStatus(playerId, true);
         ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
@@ -362,6 +377,7 @@ wss.on('connection', (ws, req) => {
         players.forEach((pd, id) => { if (id !== playerId) existingPlayers.push({ id, nickname: pd.nickname, skinData: pd.skinData, position: pd.position, quaternion: pd.quaternion }); });
         ws.send(JSON.stringify({ type: 'playerList', players: existingPlayers }));
         if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
+
         ws.on('message', async (message) => {
             try {
                 const data = JSON.parse(message);
@@ -399,6 +415,7 @@ wss.on('connection', (ws, req) => {
         });
     });
 });
+
 server.listen(port, () => {
   console.log(`Serwer nasłuchuje na porcie ${port}`);
   setTimeout(spawnCoin, 10000);
