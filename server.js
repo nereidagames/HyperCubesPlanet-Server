@@ -47,17 +47,20 @@ async function loadNexusMapToMemory() {
 }
 
 // --- POPRAWIONA FUNKCJA OBLICZANIA WYSOKOŚCI ---
-function getSafeY(x, z) {
-    let highestY = -100; // Startujemy nisko
+// isPlayer = true -> dodaje duży margines (zrzut z powietrza)
+// isPlayer = false -> kładzie przedmiot na bloku
+function getSafeY(x, z, isPlayer = false) {
+    // KROK 1: Zaokrąglamy do środka kratki (Grid Snap)
+    // Dzięki temu nie spawniemy się na krawędzi dwóch bloków
+    const gridX = Math.round(x);
+    const gridZ = Math.round(z);
+
+    let highestY = -Infinity;
     let foundBlock = false;
 
-    // Sprawdzamy każdy blok w pamięci
-    // Blok ma szerokość 1.0 i jest wyśrodkowany na swoich koordynatach.
-    // Czyli blok na x=0.5 zajmuje przestrzeń od 0.0 do 1.0.
+    // KROK 2: Szukamy najwyższego bloku w tej konkretnej kratce (X, Z)
     for (const block of nexusBlocksCache) {
-        // Sprawdzamy czy punkt (x, z) gracza mieści się w obrysie bloku
-        // Margines 0.5 w każdą stronę od środka bloku
-        if (Math.abs(x - block.x) < 0.5 && Math.abs(z - block.z) < 0.5) {
+        if (Math.round(block.x) === gridX && Math.round(block.z) === gridZ) {
             if (block.y > highestY) {
                 highestY = block.y;
                 foundBlock = true;
@@ -66,14 +69,22 @@ function getSafeY(x, z) {
     }
 
     if (foundBlock) {
-        // block.y to środek bloku. Góra bloku to block.y + 0.5.
-        // Dodajemy 2.5 jednostki zapasu, żeby gracz zrespil się w powietrzu i spadł na blok.
-        return highestY + 0.5 + 2.5; 
+        // block.y to środek geometryczny bloku.
+        // Góra bloku to: block.y + 0.5
+        const blockTop = highestY + 0.5;
+
+        if (isPlayer) {
+            // Dla gracza: Spawnujemy 3 kratki wyżej, żeby bezpiecznie opadł
+            return blockTop + 3.0;
+        } else {
+            // Dla monety: Kładziemy ją tuż nad blokiem (0.8 wygląda dobrze wizualnie)
+            return blockTop + 0.8;
+        }
     } else {
-        // Jeśli pod graczem jest pustka (dziura w mapie), 
-        // spawnujemy go na bezpiecznej wysokości domyślnej (np. 5.0), żeby nie spadł w nieskończoność od razu
-        // lub na poziomie 0, jeśli zakładamy że tam jest "niewidzialna podłoga"
-        return 5.0;
+        // Jeśli w tym miejscu jest dziura (brak bloków):
+        // Dla gracza: Zrzucamy z wysoka (niech spada na dno świata)
+        // Dla monety: Ustawiamy na standardowej wysokości
+        return isPlayer ? 30.0 : 1.0;
     }
 }
 
@@ -231,11 +242,14 @@ function broadcastToWorld(worldId, data, excludeId = null) {
 
 function spawnCoin() {
     if (currentCoin) return;
-    const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
-    const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
-    const safeY = getSafeY(x, z);
     
-    // Moneta też spada na blok
+    // Zaokrąglamy X i Z, aby pasowały do siatki
+    const x = Math.round((Math.random() - 0.5) * 2 * MAP_BOUNDS);
+    const z = Math.round((Math.random() - 0.5) * 2 * MAP_BOUNDS);
+    
+    // Sprawdzamy wysokość dla monety (false = to nie gracz)
+    const safeY = getSafeY(x, z, false);
+    
     currentCoin = { position: { x, y: safeY, z } };
     
     broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
@@ -268,12 +282,12 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`[WS] ${username} online.`);
         
-        // Losujemy pozycję na środku mapy
-        const startX = (Math.random() * 6) - 3;
-        const startZ = (Math.random() * 6) - 3;
+        // Losujemy pozycję (zaokrągloną!)
+        const startX = Math.round((Math.random() * 6) - 3);
+        const startZ = Math.round((Math.random() * 6) - 3);
         
-        // OBLICZAMY WYSOKOŚĆ (najwyższy blok + 2.5 jednostki)
-        const startY = getSafeY(startX, startZ);
+        // OBLICZAMY WYSOKOŚĆ dla Gracza (true)
+        const startY = getSafeY(startX, startZ, true);
 
         players.set(playerId, { 
             ws, id: playerId, nickname: username, 
@@ -310,9 +324,8 @@ wss.on('connection', (ws, req) => {
                         broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId);
                         p.currentWorld = newWorld;
                         
-                        // Reset pozycji: w Nexusie na górze, w innych światach default
                         if (newWorld === 'nexus') {
-                            p.position = { x: 0, y: getSafeY(0, 0), z: 0 };
+                            p.position = { x: 0, y: getSafeY(0, 0, true), z: 0 };
                         } else {
                             p.position = { x: 0, y: 5, z: 0 };
                         }
