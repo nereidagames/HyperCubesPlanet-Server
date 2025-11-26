@@ -28,7 +28,6 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
-// --- CACHE MAPY NEXUSA ---
 let nexusBlocksCache = [];
 
 async function loadNexusMapToMemory() {
@@ -46,7 +45,6 @@ async function loadNexusMapToMemory() {
     }
 }
 
-// --- SPAWN LOGIC ---
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
@@ -98,35 +96,26 @@ app.get('/api/init-database', async (req, res) => {
     return res.status(403).send('Brak autoryzacji.');
   }
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, coins INTEGER DEFAULT 0 NOT NULL, current_skin_thumbnail TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`);
-    await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, coins INTEGER DEFAULT 0 NOT NULL, current_skin_thumbnail TEXT, owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
     await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
-    
     await loadNexusMapToMemory();
-
     res.status(200).send('Baza danych zaktualizowana.');
   } catch (err) {
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
 
-// --- HELPER: Parse owned blocks ---
+// --- HELPERS & API ---
 function parseOwnedBlocks(dbValue) {
     if (!dbValue) return ["Ziemia"];
     if (Array.isArray(dbValue)) return dbValue;
-    if (typeof dbValue === 'string') {
-        try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; }
-    }
+    if (typeof dbValue === 'string') { try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; } }
     return ["Ziemia"];
 }
-
-// --- API ENDPOINTS ---
 
 app.get('/api/nexus', async (req, res) => {
     try {
@@ -153,7 +142,6 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ message: 'Brak danych.' });
   try {
     const hash = await bcrypt.hash(password, 10);
     await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb)`, [username, hash]);
@@ -168,15 +156,7 @@ app.post('/api/login', async (req, res) => {
     const u = r.rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
     const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    
-    // Zawsze zwracaj tablicę
-    const blocks = parseOwnedBlocks(u.owned_blocks);
-    
-    res.json({ 
-        token, 
-        user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
-        thumbnail: u.current_skin_thumbnail 
-    });
+    res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -185,61 +165,29 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks FROM users WHERE id = $1', [req.user.userId]);
         if (r.rows.length === 0) return res.status(404).send();
         const u = r.rows[0];
-        const blocks = parseOwnedBlocks(u.owned_blocks);
-        res.json({ 
-            user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
-            thumbnail: u.current_skin_thumbnail 
-        });
+        res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- SKLEP: KUPNO BLOKU (POPRAWIONE) ---
 app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     const { blockName, cost } = req.body;
     const userId = req.user.userId;
-
     try {
         const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]);
         if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" });
-        
         const user = userResult.rows[0];
         const currentCoins = user.coins || 0;
-        
-        // 1. Bezpieczne parsowanie posiadanych bloków
         let ownedBlocks = parseOwnedBlocks(user.owned_blocks);
-
-        // 2. Walidacja
-        if (ownedBlocks.includes(blockName)) {
-            return res.status(400).json({ message: "Już posiadasz ten blok!" });
-        }
-        if (currentCoins < cost) {
-            return res.status(400).json({ message: "Za mało monet!" });
-        }
-
-        // 3. Aktualizacja
+        if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" });
+        if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" });
         ownedBlocks.push(blockName);
         const newBalance = currentCoins - cost;
-
-        // Zapisujemy jako JSON string, żeby Postgres na pewno to zrozumiał
-        await pool.query(
-            'UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3',
-            [newBalance, JSON.stringify(ownedBlocks), userId]
-        );
-
-        // 4. Zwracamy czystą tablicę do klienta
-        res.json({ 
-            success: true, 
-            newBalance: newBalance, 
-            ownedBlocks: ownedBlocks 
-        });
-
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ message: "Błąd transakcji serwera." });
-    }
+        await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]);
+        res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks });
+    } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); }
 });
 
-// ... (Reszta API bez zmian: coins/update, skins, worlds, friends, messages) ...
+// ... Pozostałe endpointy (bez zmian) ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -257,9 +205,40 @@ app.get('/api/messages', authenticateToken, async (req, res) => { try { const r 
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const u = await pool.query('SELECT id FROM users WHERE username = $1', [req.params.username]); if (u.rows.length === 0) return res.status(404).json({ message: 'Brak.' }); const m = await pool.query(`SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1) ORDER BY m.created_at ASC`, [req.user.userId, u.rows[0].id]); res.json(m.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
 // --- WEBSOCKET ---
-function broadcastToWorld(worldId, data, excludeId = null) { const msg = JSON.stringify(data); players.forEach((p, id) => { if (p.currentWorld === worldId && id !== excludeId && p.ws.readyState === 1) { p.ws.send(msg); } }); }
-function spawnCoin() { if (currentCoin) return; const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const pos = getSmartSpawnPosition(x, z, false); currentCoin = { position: pos }; broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position }); }
-function notifyFriendsStatus(userId, isOnline) { (async () => { try { const r = await pool.query(`SELECT user_id1, user_id2 FROM friendships WHERE (user_id1=$1 OR user_id2=$1) AND status='accepted'`, [userId]); r.rows.forEach(row => { const fid = row.user_id1 === userId ? row.user_id2 : row.user_id1; const s = players.get(fid); if(s && s.ws.readyState===1) s.ws.send(JSON.stringify({ type: 'friendStatusChange' })); }); } catch (e) {} })(); }
+
+// FUNKCJA BROADCAST - filtruje po worldId
+function broadcastToWorld(worldId, data, excludeId = null) {
+    const msg = JSON.stringify(data);
+    players.forEach((p, id) => {
+        // Wysyłamy tylko jeśli gracz jest w tym samym świecie
+        if (p.currentWorld === worldId && id !== excludeId && p.ws.readyState === 1) {
+            p.ws.send(msg);
+        }
+    });
+}
+
+function spawnCoin() {
+    if (currentCoin) return;
+    const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
+    const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
+    const pos = getSmartSpawnPosition(x, z, false);
+    currentCoin = { position: pos };
+    // Moneta pojawia się tylko w Nexusie
+    broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
+}
+
+function notifyFriendsStatus(userId, isOnline) {
+    (async () => {
+        try {
+            const r = await pool.query(`SELECT user_id1, user_id2 FROM friendships WHERE (user_id1=$1 OR user_id2=$1) AND status='accepted'`, [userId]);
+            r.rows.forEach(row => {
+                const fid = row.user_id1 === userId ? row.user_id2 : row.user_id1;
+                const s = players.get(fid);
+                if(s && s.ws.readyState===1) s.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
+            });
+        } catch (e) {}
+    })();
+}
 
 wss.on('connection', (ws, req) => {
     ws.isAlive = true; ws.on('pong', () => { ws.isAlive = true; });
@@ -268,22 +247,66 @@ wss.on('connection', (ws, req) => {
         if (err) { ws.close(1008); return; }
         const playerId = parseInt(decoded.userId); const username = decoded.username; console.log(`[WS] ${username} online.`);
         const startX = Math.floor((Math.random() * 6) - 3) + 0.5; const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; const pos = getSmartSpawnPosition(startX, startZ, true);
-        players.set(playerId, { ws, id: playerId, nickname: username, skinData: null, thumbnail: null, position: pos, quaternion: { _x:0,_y:0,_z:0,_w:1 }, currentWorld: 'nexus' });
+        
+        players.set(playerId, { 
+            ws, id: playerId, nickname: username, 
+            skinData: null, thumbnail: null, 
+            position: pos, 
+            quaternion: { _x:0,_y:0,_z:0,_w:1 },
+            currentWorld: 'nexus' // Domyślnie Nexus
+        });
+        
         notifyFriendsStatus(playerId, true);
-        setTimeout(() => { if (ws.readyState === ws.OPEN) { ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: pos })); const nexusPlayers = []; players.forEach((p, id) => { if (id !== playerId && p.currentWorld === 'nexus') { nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); } }, 1500);
+        
+        setTimeout(() => { 
+            if (ws.readyState === ws.OPEN) { 
+                ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: pos })); 
+                const nexusPlayers = []; 
+                players.forEach((p, id) => { 
+                    if (id !== playerId && p.currentWorld === 'nexus') { 
+                        nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); 
+                    } 
+                }); 
+                ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); 
+                if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); 
+            } 
+        }, 1500);
+
         ws.on('message', async (message) => {
             try {
                 const data = JSON.parse(message); const p = players.get(playerId); if (!p) return;
+                
                 if (data.type === 'joinWorld') {
                     const oldWorld = p.currentWorld; const newWorld = data.worldId || 'nexus';
                     if (oldWorld !== newWorld) {
-                        broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); p.currentWorld = newWorld;
+                        broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); 
+                        p.currentWorld = newWorld;
                         if (newWorld === 'nexus') { p.position = getSmartSpawnPosition(0.5, 0.5, true); } else { p.position = { x: 0, y: 5, z: 0 }; }
-                        const roomPlayers = []; players.forEach((other, oid) => { if (oid !== playerId && other.currentWorld === newWorld) { roomPlayers.push({ id: other.id, nickname: other.nickname, skinData: other.skinData, position: other.position, quaternion: other.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers })); broadcastToWorld(newWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: p.skinData, position: p.position, quaternion: p.quaternion }, playerId); if (newWorld === 'nexus' && currentCoin) { ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); }
-                    } return;
+                        
+                        const roomPlayers = []; 
+                        players.forEach((other, oid) => { 
+                            if (oid !== playerId && other.currentWorld === newWorld) { 
+                                roomPlayers.push({ id: other.id, nickname: other.nickname, skinData: other.skinData, position: other.position, quaternion: other.quaternion }); 
+                            } 
+                        }); 
+                        ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers })); 
+                        broadcastToWorld(newWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: p.skinData, position: p.position, quaternion: p.quaternion }, playerId); 
+                        if (newWorld === 'nexus' && currentCoin) { ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); }
+                    } 
+                    return;
                 }
-                if (data.type === 'playerReady') { p.skinData = data.skinData; broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId); }
-                if (data.type === 'chatMessage') { broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); }
+                
+                if (data.type === 'playerReady') { 
+                    p.skinData = data.skinData; 
+                    broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId); 
+                }
+                
+                // --- CZAT PER WORLD ---
+                if (data.type === 'chatMessage') { 
+                    // Używa broadcastToWorld z obecnym światem gracza
+                    broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); 
+                }
+                
                 if (data.type === 'playerMove') { p.position = data.position; p.quaternion = data.quaternion; broadcastToWorld(p.currentWorld, { type: 'playerMove', id: playerId, position: data.position, quaternion: data.quaternion }, playerId); }
                 if (data.type === 'collectCoin') { if (p.currentWorld === 'nexus' && currentCoin) { currentCoin = null; broadcastToWorld('nexus', { type: 'coinCollected' }); try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + 200 WHERE id = $1 RETURNING coins', [playerId]); if(r.rows.length > 0) ws.send(JSON.stringify({ type: 'updateBalance', newBalance: r.rows[0].coins })); } catch(e) {} setTimeout(spawnCoin, 5000); } }
                 if (data.type === 'sendPrivateMessage') { const { recipient: recipientName, text } = data; try { const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]); if(r.rows.length > 0) { const recipientId = r.rows[0].id; await pool.query('INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)', [playerId, recipientId, text]); ws.send(JSON.stringify({ type: 'privateMessageSent', recipient: recipientName, text })); const rp = players.get(recipientId); if(rp && rp.ws.readyState===1) rp.ws.send(JSON.stringify({ type: 'privateMessageReceived', sender: { id: playerId, nickname: username }, text })); } } catch(e) {} }
