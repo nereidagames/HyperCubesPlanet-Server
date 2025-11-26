@@ -28,10 +28,15 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
+// --- CACHE MAPY NEXUSA ---
 let nexusBlocksCache = [];
 
 async function loadNexusMapToMemory() {
     try {
+        // Sprawdzamy czy tabela istnieje (dla bezpieczeństwa)
+        const tableCheck = await pool.query(`SELECT to_regclass('public.nexus_map');`);
+        if (!tableCheck.rows[0].to_regclass) return;
+
         const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
         if (result.rows.length > 0) {
             nexusBlocksCache = result.rows[0].map_data || [];
@@ -40,11 +45,12 @@ async function loadNexusMapToMemory() {
             nexusBlocksCache = [];
         }
     } catch (e) {
-        console.error("[Server] Błąd ładowania mapy:", e);
+        console.error("[Server] Błąd cache mapy:", e.message);
         nexusBlocksCache = [];
     }
 }
 
+// --- SPAWN LOGIC ---
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
@@ -96,26 +102,38 @@ app.get('/api/init-database', async (req, res) => {
     return res.status(403).send('Brak autoryzacji.');
   }
   try {
-    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, coins INTEGER DEFAULT 0 NOT NULL, current_skin_thumbnail TEXT, owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+    await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, coins INTEGER DEFAULT 0 NOT NULL, current_skin_thumbnail TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+    
+    // Bezpieczne dodawanie kolumn
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
+    try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
+
     await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
     await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
+    
     await loadNexusMapToMemory();
+
     res.status(200).send('Baza danych zaktualizowana.');
   } catch (err) {
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
 
-// --- HELPERS & API ---
+// --- HELPER: Parsowanie bloków ---
 function parseOwnedBlocks(dbValue) {
     if (!dbValue) return ["Ziemia"];
     if (Array.isArray(dbValue)) return dbValue;
-    if (typeof dbValue === 'string') { try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; } }
+    if (typeof dbValue === 'string') {
+        try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; }
+    }
     return ["Ziemia"];
 }
+
+// --- API ENDPOINTS ---
 
 app.get('/api/nexus', async (req, res) => {
     try {
@@ -142,6 +160,7 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
+  if (!username || !password) return res.status(400).json({ message: 'Brak danych.' });
   try {
     const hash = await bcrypt.hash(password, 10);
     await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb)`, [username, hash]);
@@ -156,7 +175,14 @@ app.post('/api/login', async (req, res) => {
     const u = r.rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
     const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
+    
+    const blocks = parseOwnedBlocks(u.owned_blocks);
+    
+    res.json({ 
+        token, 
+        user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
+        thumbnail: u.current_skin_thumbnail 
+    });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -165,29 +191,54 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks FROM users WHERE id = $1', [req.user.userId]);
         if (r.rows.length === 0) return res.status(404).send();
         const u = r.rows[0];
-        res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
+        const blocks = parseOwnedBlocks(u.owned_blocks);
+        res.json({ 
+            user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
+            thumbnail: u.current_skin_thumbnail 
+        });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     const { blockName, cost } = req.body;
     const userId = req.user.userId;
+
     try {
         const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]);
         if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" });
+        
         const user = userResult.rows[0];
         const currentCoins = user.coins || 0;
         let ownedBlocks = parseOwnedBlocks(user.owned_blocks);
-        if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" });
-        if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" });
+
+        if (ownedBlocks.includes(blockName)) {
+            return res.status(400).json({ message: "Już posiadasz ten blok!" });
+        }
+        if (currentCoins < cost) {
+            return res.status(400).json({ message: "Za mało monet!" });
+        }
+
         ownedBlocks.push(blockName);
         const newBalance = currentCoins - cost;
-        await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]);
-        res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks });
-    } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); }
+
+        await pool.query(
+            'UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3',
+            [newBalance, JSON.stringify(ownedBlocks), userId]
+        );
+
+        res.json({ 
+            success: true, 
+            newBalance: newBalance, 
+            ownedBlocks: ownedBlocks 
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: "Błąd transakcji serwera." });
+    }
 });
 
-// ... Pozostałe endpointy (bez zmian) ...
+// ... Standardowe endpointy ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -204,13 +255,12 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => { try { con
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT DISTINCT ON (other_user_id) other_user_id, other_username, message_text, created_at FROM (SELECT CASE WHEN sender_id=$1 THEN recipient_id ELSE sender_id END as other_user_id, m.message_text, m.created_at FROM private_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1 ORDER BY m.created_at DESC) AS sub JOIN users u ON u.id = sub.other_user_id GROUP BY other_user_id, other_username, message_text, created_at ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const u = await pool.query('SELECT id FROM users WHERE username = $1', [req.params.username]); if (u.rows.length === 0) return res.status(404).json({ message: 'Brak.' }); const m = await pool.query(`SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1) ORDER BY m.created_at ASC`, [req.user.userId, u.rows[0].id]); res.json(m.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// --- WEBSOCKET ---
+// --- WEBSOCKET (Z obsługą pokoi/światów) ---
 
-// FUNKCJA BROADCAST - filtruje po worldId
 function broadcastToWorld(worldId, data, excludeId = null) {
     const msg = JSON.stringify(data);
     players.forEach((p, id) => {
-        // Wysyłamy tylko jeśli gracz jest w tym samym świecie
+        // Wysyłamy tylko do graczy w TYM SAMYM świecie
         if (p.currentWorld === worldId && id !== excludeId && p.ws.readyState === 1) {
             p.ws.send(msg);
         }
@@ -223,7 +273,7 @@ function spawnCoin() {
     const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     const pos = getSmartSpawnPosition(x, z, false);
     currentCoin = { position: pos };
-    // Moneta pojawia się tylko w Nexusie
+    // Moneta spawnuje się tylko w Nexusie
     broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
 }
 
@@ -246,7 +296,10 @@ wss.on('connection', (ws, req) => {
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) { ws.close(1008); return; }
         const playerId = parseInt(decoded.userId); const username = decoded.username; console.log(`[WS] ${username} online.`);
-        const startX = Math.floor((Math.random() * 6) - 3) + 0.5; const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; const pos = getSmartSpawnPosition(startX, startZ, true);
+        
+        const startX = Math.floor((Math.random() * 6) - 3) + 0.5; 
+        const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; 
+        const pos = getSmartSpawnPosition(startX, startZ, true);
         
         players.set(playerId, { 
             ws, id: playerId, nickname: username, 
@@ -282,7 +335,6 @@ wss.on('connection', (ws, req) => {
                         broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); 
                         p.currentWorld = newWorld;
                         if (newWorld === 'nexus') { p.position = getSmartSpawnPosition(0.5, 0.5, true); } else { p.position = { x: 0, y: 5, z: 0 }; }
-                        
                         const roomPlayers = []; 
                         players.forEach((other, oid) => { 
                             if (oid !== playerId && other.currentWorld === newWorld) { 
@@ -301,9 +353,8 @@ wss.on('connection', (ws, req) => {
                     broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId); 
                 }
                 
-                // --- CZAT PER WORLD ---
+                // --- OBSŁUGA CZATU PER POKÓJ ---
                 if (data.type === 'chatMessage') { 
-                    // Używa broadcastToWorld z obecnym światem gracza
                     broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); 
                 }
                 
@@ -316,4 +367,10 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(port, () => { console.log(`Serwer: ${port}`); loadNexusMapToMemory(); setTimeout(spawnCoin, 10000); const RENDER_URL = process.env.RENDER_EXTERNAL_URL; if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); });
+server.listen(port, () => { 
+    console.log(`Serwer: ${port}`); 
+    loadNexusMapToMemory(); 
+    setTimeout(spawnCoin, 10000); 
+    const RENDER_URL = process.env.RENDER_EXTERNAL_URL; 
+    if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); 
+});
