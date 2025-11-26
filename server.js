@@ -51,7 +51,7 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
 
-    // Szukamy bloku pod podanymi współrzędnymi
+    // Szukamy bloku w promieniu (trochę ponad pół kratki)
     const searchRadius = 0.6;
 
     for (const block of nexusBlocksCache) {
@@ -65,8 +65,8 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
 
     if (highestBlock) {
         // Znaleziono blok.
-        // Jeśli to gracz -> spawnujemy 20 metrów nad blokiem (żeby spadł)
-        // Jeśli to moneta -> spawnujemy 0.8 metra nad blokiem (żeby leżała)
+        // Dla gracza: Spawnujemy 20 metrów nad blokiem (czas na załadowanie kolizji podczas spadania)
+        // Dla monety: Spawnujemy 0.8 metra nad blokiem
         const offset = isPlayer ? 20.0 : 0.8; 
         
         return {
@@ -75,10 +75,10 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
             z: highestBlock.z  // Wyrównanie do środka bloku
         };
     } else {
-        // Brak bloku (dziura)
+        // Brak bloku (dziura) - zrzucamy gracza w otchłań (wysoko), moneta standardowo
         return {
             x: targetX,
-            y: isPlayer ? 40.0 : 1.0, // Jeszcze wyżej dla gracza w przypadku dziury
+            y: isPlayer ? 30.0 : 1.0, 
             z: targetZ
         };
     }
@@ -238,14 +238,10 @@ function broadcastToWorld(worldId, data, excludeId = null) {
 
 function spawnCoin() {
     if (currentCoin) return;
-    
-    // Losujemy pozycję (zaokrągloną do siatki!)
     const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     
-    // Używamy getSmartSpawnPosition (isPlayer = false)
     const pos = getSmartSpawnPosition(x, z, false);
-    
     currentCoin = { position: pos };
     
     broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
@@ -278,13 +274,12 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`[WS] ${username} online.`);
         
-        // Losowanie pozycji w pobliżu środka
+        // --- KROK 1: Obliczamy pozycję startową ---
         const startX = Math.floor((Math.random() * 6) - 3) + 0.5;
         const startZ = Math.floor((Math.random() * 6) - 3) + 0.5;
-        
-        // DYNAMICZNY SPAWN (isPlayer = true) -> 20m w górę
         const pos = getSmartSpawnPosition(startX, startZ, true);
 
+        // --- KROK 2: Inicjalizacja obiektu gracza na serwerze ---
         players.set(playerId, { 
             ws, id: playerId, nickname: username, 
             skinData: null, thumbnail: null, 
@@ -294,17 +289,27 @@ wss.on('connection', (ws, req) => {
         });
 
         notifyFriendsStatus(playerId, true);
-        ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username }));
 
-        const nexusPlayers = [];
-        players.forEach((p, id) => { 
-            if (id !== playerId && p.currentWorld === 'nexus') {
-                nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); 
+        // --- KROK 3: OPÓŹNIENIE STARTU (ROZWIĄZANIE PROBLEMU SPAWNU) ---
+        // Czekamy 1.5 sekundy, aż klient załaduje mapę, i dopiero wysyłamy "welcome".
+        setTimeout(() => {
+            if (ws.readyState === ws.OPEN) {
+                // Wysyłamy pozycję startową (z wysokiego pułapu)
+                ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: pos }));
+
+                // Wysyłamy listę innych graczy
+                const nexusPlayers = [];
+                players.forEach((p, id) => { 
+                    if (id !== playerId && p.currentWorld === 'nexus') {
+                        nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); 
+                    }
+                });
+                ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers }));
+                
+                // Wysyłamy monetę
+                if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
             }
-        });
-        ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers }));
-        
-        if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position }));
+        }, 1500); // 1.5 sekundy czekania
 
         ws.on('message', async (message) => {
             try {
@@ -321,6 +326,7 @@ wss.on('connection', (ws, req) => {
                         p.currentWorld = newWorld;
                         
                         if (newWorld === 'nexus') {
+                            // Przy powrocie do Nexusa też dodaj małe opóźnienie dla bezpieczeństwa
                             p.position = getSmartSpawnPosition(0.5, 0.5, true);
                         } else {
                             p.position = { x: 0, y: 5, z: 0 };
@@ -339,6 +345,7 @@ wss.on('connection', (ws, req) => {
                         
                         ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers }));
                         
+                        // Broadcastujemy do innych, że dołączyliśmy
                         broadcastToWorld(newWorld, { 
                             type: 'playerJoined', 
                             id: playerId, nickname: username, 
@@ -355,40 +362,14 @@ wss.on('connection', (ws, req) => {
 
                 if (data.type === 'playerReady') {
                     p.skinData = data.skinData;
+                    // Ważne: przy playerReady też wysyłamy aktualną pozycję (wysoką), żeby zsynchronizować
                     broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId);
                 }
-                if (data.type === 'chatMessage') {
-                    broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text });
-                }
-                if (data.type === 'playerMove') {
-                    p.position = data.position;
-                    p.quaternion = data.quaternion;
-                    broadcastToWorld(p.currentWorld, { type: 'playerMove', id: playerId, position: data.position, quaternion: data.quaternion }, playerId);
-                }
-                if (data.type === 'collectCoin') {
-                    if (p.currentWorld === 'nexus' && currentCoin) {
-                        currentCoin = null;
-                        broadcastToWorld('nexus', { type: 'coinCollected' });
-                        try { 
-                            const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + 200 WHERE id = $1 RETURNING coins', [playerId]); 
-                            if(r.rows.length > 0) ws.send(JSON.stringify({ type: 'updateBalance', newBalance: r.rows[0].coins }));
-                        } catch(e) {}
-                        setTimeout(spawnCoin, 5000);
-                    }
-                }
-                if (data.type === 'sendPrivateMessage') {
-                    const { recipient: recipientName, text } = data;
-                    try {
-                        const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]);
-                        if(r.rows.length > 0) {
-                            const recipientId = r.rows[0].id;
-                            await pool.query('INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)', [playerId, recipientId, text]);
-                            ws.send(JSON.stringify({ type: 'privateMessageSent', recipient: recipientName, text }));
-                            const rp = players.get(recipientId);
-                            if(rp && rp.ws.readyState===1) rp.ws.send(JSON.stringify({ type: 'privateMessageReceived', sender: { id: playerId, nickname: username }, text }));
-                        }
-                    } catch(e) {}
-                }
+                // ... (reszta obsługi wiadomości bez zmian) ...
+                if (data.type === 'chatMessage') { broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); }
+                if (data.type === 'playerMove') { p.position = data.position; p.quaternion = data.quaternion; broadcastToWorld(p.currentWorld, { type: 'playerMove', id: playerId, position: data.position, quaternion: data.quaternion }, playerId); }
+                if (data.type === 'collectCoin') { if (p.currentWorld === 'nexus' && currentCoin) { currentCoin = null; broadcastToWorld('nexus', { type: 'coinCollected' }); try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + 200 WHERE id = $1 RETURNING coins', [playerId]); if(r.rows.length > 0) ws.send(JSON.stringify({ type: 'updateBalance', newBalance: r.rows[0].coins })); } catch(e) {} setTimeout(spawnCoin, 5000); } }
+                if (data.type === 'sendPrivateMessage') { const { recipient: recipientName, text } = data; try { const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]); if(r.rows.length > 0) { const recipientId = r.rows[0].id; await pool.query('INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)', [playerId, recipientId, text]); ws.send(JSON.stringify({ type: 'privateMessageSent', recipient: recipientName, text })); const rp = players.get(recipientId); if(rp && rp.ws.readyState===1) rp.ws.send(JSON.stringify({ type: 'privateMessageReceived', sender: { id: playerId, nickname: username }, text })); } } catch(e) {} }
             } catch (e) {}
         });
         ws.on('close', () => {
