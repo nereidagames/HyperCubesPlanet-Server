@@ -46,45 +46,44 @@ async function loadNexusMapToMemory() {
     }
 }
 
-// --- POPRAWIONA FUNKCJA OBLICZANIA WYSOKOŚCI ---
-// isPlayer = true -> dodaje duży margines (zrzut z powietrza)
-// isPlayer = false -> kładzie przedmiot na bloku
-function getSafeY(x, z, isPlayer = false) {
-    // KROK 1: Zaokrąglamy do środka kratki (Grid Snap)
-    // Dzięki temu nie spawniemy się na krawędzi dwóch bloków
-    const gridX = Math.round(x);
-    const gridZ = Math.round(z);
+// --- INTELIGENTNY SYSTEM SPAWNU ---
+// Zwraca obiekt { x, y, z } - poprawioną pozycję
+function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
+    let highestBlock = null;
+    let highestY = -1000;
 
-    let highestY = -Infinity;
-    let foundBlock = false;
+    // Promień szukania bloku pod nogami (0.6 to trochę więcej niż pół bloku)
+    const searchRadius = 0.6;
 
-    // KROK 2: Szukamy najwyższego bloku w tej konkretnej kratce (X, Z)
     for (const block of nexusBlocksCache) {
-        if (Math.round(block.x) === gridX && Math.round(block.z) === gridZ) {
+        // Sprawdzamy, czy wylosowany punkt jest nad tym blokiem
+        if (Math.abs(targetX - block.x) < searchRadius && Math.abs(targetZ - block.z) < searchRadius) {
             if (block.y > highestY) {
                 highestY = block.y;
-                foundBlock = true;
+                highestBlock = block;
             }
         }
     }
 
-    if (foundBlock) {
-        // block.y to środek geometryczny bloku.
-        // Góra bloku to: block.y + 0.5
-        const blockTop = highestY + 0.5;
-
-        if (isPlayer) {
-            // Dla gracza: Spawnujemy 3 kratki wyżej, żeby bezpiecznie opadł
-            return blockTop + 3.0;
-        } else {
-            // Dla monety: Kładziemy ją tuż nad blokiem (0.8 wygląda dobrze wizualnie)
-            return blockTop + 0.8;
-        }
+    if (highestBlock) {
+        // ZNALEZIONO BLOK!
+        // Kluczowa zmiana: Ustawiamy X i Z na środek znalezionego bloku.
+        // To eliminuje wpadanie w szczeliny między 4 blokami.
+        
+        const safeY = highestY + 0.5 + (isPlayer ? 2.0 : 0.8); // +0.5 to góra bloku, +2.0 to zrzut gracza, +0.8 to lewitacja monety
+        
+        return {
+            x: highestBlock.x, // Snap to grid
+            y: safeY,
+            z: highestBlock.z  // Snap to grid
+        };
     } else {
-        // Jeśli w tym miejscu jest dziura (brak bloków):
-        // Dla gracza: Zrzucamy z wysoka (niech spada na dno świata)
-        // Dla monety: Ustawiamy na standardowej wysokości
-        return isPlayer ? 30.0 : 1.0;
+        // Brak bloku (dziura) - spawnuje wysoko, żeby spaść (dla gracza) lub domyślnie (dla monety)
+        return {
+            x: targetX,
+            y: isPlayer ? 20.0 : 1.0, 
+            z: targetZ
+        };
     }
 }
 
@@ -208,7 +207,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// ... (API bez zmian) ...
+// ... (API) ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => {
     try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); }
 });
@@ -243,14 +242,14 @@ function broadcastToWorld(worldId, data, excludeId = null) {
 function spawnCoin() {
     if (currentCoin) return;
     
-    // Zaokrąglamy X i Z, aby pasowały do siatki
-    const x = Math.round((Math.random() - 0.5) * 2 * MAP_BOUNDS);
-    const z = Math.round((Math.random() - 0.5) * 2 * MAP_BOUNDS);
+    // Losujemy pozycję (zaokrągloną do siatki!)
+    const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
+    const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     
-    // Sprawdzamy wysokość dla monety (false = to nie gracz)
-    const safeY = getSafeY(x, z, false);
+    // Używamy getSmartSpawnPosition, żeby moneta "snapowała" do bloków
+    const pos = getSmartSpawnPosition(x, z, false);
     
-    currentCoin = { position: { x, y: safeY, z } };
+    currentCoin = { position: pos };
     
     broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
 }
@@ -282,17 +281,17 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`[WS] ${username} online.`);
         
-        // Losujemy pozycję (zaokrągloną!)
-        const startX = Math.round((Math.random() * 6) - 3);
-        const startZ = Math.round((Math.random() * 6) - 3);
+        // Losowanie pozycji w pobliżu środka
+        const startX = Math.floor((Math.random() * 6) - 3) + 0.5;
+        const startZ = Math.floor((Math.random() * 6) - 3) + 0.5;
         
-        // OBLICZAMY WYSOKOŚĆ dla Gracza (true)
-        const startY = getSafeY(startX, startZ, true);
+        // DYNAMICZNY SPAWN (isPlayer = true)
+        const pos = getSmartSpawnPosition(startX, startZ, true);
 
         players.set(playerId, { 
             ws, id: playerId, nickname: username, 
             skinData: null, thumbnail: null, 
-            position: { x: startX, y: startY, z: startZ }, 
+            position: pos, 
             quaternion: { _x:0,_y:0,_z:0,_w:1 },
             currentWorld: 'nexus'
         });
@@ -325,7 +324,7 @@ wss.on('connection', (ws, req) => {
                         p.currentWorld = newWorld;
                         
                         if (newWorld === 'nexus') {
-                            p.position = { x: 0, y: getSafeY(0, 0, true), z: 0 };
+                            p.position = getSmartSpawnPosition(0.5, 0.5, true);
                         } else {
                             p.position = { x: 0, y: 5, z: 0 };
                         }
