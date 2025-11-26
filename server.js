@@ -27,30 +27,9 @@ const pool = new Pool({
 const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
+
+// --- CACHE MAPY NEXUSA ---
 let nexusBlocksCache = [];
-
-// --- AUTOMATYCZNA MIGRACJA BAZY DANYCH ---
-// To uruchamia się przy starcie serwera i dodaje brakujące tabele/kolumny
-async function autoMigrate() {
-    console.log("[Server] Sprawdzanie struktury bazy danych...");
-    try {
-        // Tworzenie tabel
-        await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-        await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
-        await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-        // ... (reszta tabel tworzy się przy init-db, tu dodajemy krytyczne kolumny)
-
-        // Dodawanie brakujących kolumn (bezpiecznie)
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`);
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
-        // TO JEST KLUCZOWE DLA TWOJEGO PROBLEMU:
-        await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`);
-        
-        console.log("[Server] Baza danych zaktualizowana pomyślnie.");
-    } catch (e) {
-        console.error("[Server] Błąd migracji bazy:", e.message);
-    }
-}
 
 async function loadNexusMapToMemory() {
     try {
@@ -71,10 +50,17 @@ async function loadNexusMapToMemory() {
     }
 }
 
+// --- INTELIGENTNY SYSTEM SPAWNU ---
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
-    const searchRadius = 0.6;
+    const searchRadius = 0.6; // Szukamy bloku w tej kratce
+
+    // Jeśli cache jest pusty, to znaczy że baza nie odpowiedziała.
+    // Wtedy zwracamy bardzo wysoką pozycję, żeby gracz nie utknął w podłodze
+    if (nexusBlocksCache.length === 0) {
+        return { x: targetX, y: 30.0, z: targetZ };
+    }
 
     for (const block of nexusBlocksCache) {
         if (Math.abs(targetX - block.x) < searchRadius && Math.abs(targetZ - block.z) < searchRadius) {
@@ -86,10 +72,23 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     }
 
     if (highestBlock) {
+        // Znaleziono blok
+        // Dla gracza: Spawnujemy 20 metrów nad blokiem (żeby spadł i załadował fizykę)
+        // Dla monety: 0.8m nad blokiem
         const offset = isPlayer ? 20.0 : 0.8; 
-        return { x: highestBlock.x, y: highestY + 0.5 + offset, z: highestBlock.z };
+        
+        return {
+            x: highestBlock.x, 
+            y: highestY + 0.5 + offset, 
+            z: highestBlock.z 
+        };
     } else {
-        return { x: targetX, y: isPlayer ? 30.0 : 1.0, z: targetZ };
+        // Brak bloku (dziura w mapie) -> zrzut z wysoka
+        return {
+            x: targetX,
+            y: isPlayer ? 30.0 : 1.0, 
+            z: targetZ
+        };
     }
 }
 
@@ -115,7 +114,44 @@ const interval = setInterval(function ping() {
 
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
-// --- HELPER: Parsowanie bloków ---
+// --- INIT DB ---
+async function autoMigrate() {
+    console.log("[Server] Sprawdzanie struktury bazy danych...");
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        
+        // Bezpieczne dodawanie kolumn
+        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
+        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
+        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
+
+        // Tabele relacyjne
+        await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        
+        // Inicjalizacja pustej mapy jeśli nie istnieje
+        const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
+        if (mapCheck.rowCount === 0) {
+            await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`);
+        }
+
+        await loadNexusMapToMemory();
+        console.log("[Server] Baza danych gotowa.");
+    } catch (e) {
+        console.error("[Server] Błąd migracji:", e.message);
+    }
+}
+
+// Uruchamiamy migrację przy starcie (zamiast endpointu init-db)
+app.get('/api/init-database', async (req, res) => {
+    await autoMigrate();
+    res.send("Migracja uruchomiona ręcznie.");
+});
+
+// --- HELPER ---
 function parseOwnedBlocks(dbValue) {
     if (!dbValue) return ["Ziemia"];
     if (Array.isArray(dbValue)) return dbValue;
@@ -126,16 +162,15 @@ function parseOwnedBlocks(dbValue) {
 }
 
 // --- API ENDPOINTS ---
-
 app.get('/api/nexus', async (req, res) => {
     try {
         if (nexusBlocksCache.length > 0) res.json(nexusBlocksCache);
         else {
             const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
             if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data; res.json(result.rows[0].map_data); }
-            else res.status(404).json({ message: 'Brak mapy' });
+            else res.json([]); 
         }
-    } catch (e) { res.status(500).json({ message: 'Błąd serwera' }); }
+    } catch (e) { res.json([]); }
 });
 
 app.post('/api/nexus', authenticateToken, async (req, res) => {
@@ -146,13 +181,12 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
     try {
         await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]);
         nexusBlocksCache = blocks;
-        res.json({ message: 'Nexus zaktualizowany!' });
+        res.json({ message: 'Zapisano!' });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.post('/api/register', async (req, res) => {
   const { username, password } = req.body;
-  if (!username || !password) return res.status(400).json({ message: 'Brak danych.' });
   try {
     const hash = await bcrypt.hash(password, 10);
     await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb)`, [username, hash]);
@@ -167,72 +201,38 @@ app.post('/api/login', async (req, res) => {
     const u = r.rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
     const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    
-    const blocks = parseOwnedBlocks(u.owned_blocks);
-    
-    res.json({ 
-        token, 
-        user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
-        thumbnail: u.current_skin_thumbnail 
-    });
+    res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
   } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.get('/api/user/me', authenticateToken, async (req, res) => {
     try {
-        // Pobieramy owned_blocks. Jeśli kolumna nie istnieje (błąd migracji), zapytanie może paść, 
-        // ale autoMigrate powinno to naprawić przy starcie.
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks FROM users WHERE id = $1', [req.user.userId]);
         if (r.rows.length === 0) return res.status(404).send();
         const u = r.rows[0];
-        const blocks = parseOwnedBlocks(u.owned_blocks);
-        res.json({ 
-            user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
-            thumbnail: u.current_skin_thumbnail 
-        });
+        res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks) }, thumbnail: u.current_skin_thumbnail });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
 app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     const { blockName, cost } = req.body;
     const userId = req.user.userId;
-
     try {
         const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]);
         if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" });
-        
         const user = userResult.rows[0];
         const currentCoins = user.coins || 0;
         let ownedBlocks = parseOwnedBlocks(user.owned_blocks);
-
-        if (ownedBlocks.includes(blockName)) {
-            return res.status(400).json({ message: "Już posiadasz ten blok!" });
-        }
-        if (currentCoins < cost) {
-            return res.status(400).json({ message: "Za mało monet!" });
-        }
-
+        if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" });
+        if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" });
         ownedBlocks.push(blockName);
         const newBalance = currentCoins - cost;
-
-        await pool.query(
-            'UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3',
-            [newBalance, JSON.stringify(ownedBlocks), userId]
-        );
-
-        res.json({ 
-            success: true, 
-            newBalance: newBalance, 
-            ownedBlocks: ownedBlocks 
-        });
-
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ message: "Błąd transakcji serwera." });
-    }
+        await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]);
+        res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks });
+    } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); }
 });
 
-// ... Reszta API bez zmian ...
+// ... REST ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -260,10 +260,46 @@ wss.on('connection', (ws, req) => {
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) { ws.close(1008); return; }
         const playerId = parseInt(decoded.userId); const username = decoded.username; console.log(`[WS] ${username} online.`);
-        const startX = Math.floor((Math.random() * 6) - 3) + 0.5; const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; const pos = getSmartSpawnPosition(startX, startZ, true);
-        players.set(playerId, { ws, id: playerId, nickname: username, skinData: null, thumbnail: null, position: pos, quaternion: { _x:0,_y:0,_z:0,_w:1 }, currentWorld: 'nexus' });
+        
+        // 1. Obliczamy pozycję domyślną (wysoko)
+        let pos = { x: 0, y: 30, z: 0 };
+
+        // 2. Inicjalizujemy gracza
+        players.set(playerId, { 
+            ws, id: playerId, nickname: username, 
+            skinData: null, thumbnail: null, 
+            position: pos, 
+            quaternion: { _x:0,_y:0,_z:0,_w:1 }, 
+            currentWorld: 'nexus' 
+        });
         notifyFriendsStatus(playerId, true);
-        setTimeout(() => { if (ws.readyState === ws.OPEN) { ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: pos })); const nexusPlayers = []; players.forEach((p, id) => { if (id !== playerId && p.currentWorld === 'nexus') { nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); } }, 1500);
+
+        // 3. OPOŹNIONY START I OBLICZENIE POZYCJI
+        setTimeout(() => { 
+            if (ws.readyState === ws.OPEN) { 
+                // Teraz, kiedy mapa jest w pamięci, obliczamy prawdziwą pozycję
+                const startX = Math.floor((Math.random() * 6) - 3) + 0.5; 
+                const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; 
+                const realPos = getSmartSpawnPosition(startX, startZ, true);
+                
+                // Aktualizujemy gracza
+                const p = players.get(playerId);
+                if(p) p.position = realPos;
+
+                // Wysyłamy welcome z poprawną pozycją
+                ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: realPos })); 
+                
+                const nexusPlayers = []; 
+                players.forEach((p, id) => { 
+                    if (id !== playerId && p.currentWorld === 'nexus') { 
+                        nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); 
+                    } 
+                }); 
+                ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); 
+                if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); 
+            } 
+        }, 1500);
+
         ws.on('message', async (message) => {
             try {
                 const data = JSON.parse(message); const p = players.get(playerId); if (!p) return;
@@ -286,11 +322,4 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(port, () => { 
-    console.log(`Serwer: ${port}`); 
-    autoMigrate(); // TO WYWOŁA SIĘ PRZY STARCIE I NAPRAWI BAZĘ
-    loadNexusMapToMemory(); 
-    setTimeout(spawnCoin, 10000); 
-    const RENDER_URL = process.env.RENDER_EXTERNAL_URL; 
-    if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); 
-});
+server.listen(port, () => { console.log(`Serwer: ${port}`); autoMigrate(); loadNexusMapToMemory(); setTimeout(spawnCoin, 10000); const RENDER_URL = process.env.RENDER_EXTERNAL_URL; if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); });
