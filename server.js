@@ -29,7 +29,6 @@ let currentCoin = null;
 const MAP_BOUNDS = 30;
 
 // --- CACHE MAPY NEXUSA ---
-// Przechowujemy bloki w pamięci, aby obliczać wysokość spawnu bez pytań do bazy co chwilę
 let nexusBlocksCache = [];
 
 async function loadNexusMapToMemory() {
@@ -47,19 +46,18 @@ async function loadNexusMapToMemory() {
     }
 }
 
-// Funkcja obliczająca bezpieczną wysokość (Y) w danym punkcie (X, Z)
+// --- POPRAWIONA FUNKCJA OBLICZANIA WYSOKOŚCI ---
 function getSafeY(x, z) {
-    // Zaokrąglamy współrzędne, aby pasowały do siatki bloków
-    const gridX = Math.round(x);
-    const gridZ = Math.round(z);
-    
-    let highestY = -10; // Domyślna podłoga, jeśli nie ma bloków (np. -0.5 lub niżej)
+    let highestY = -100; // Startujemy nisko
     let foundBlock = false;
 
-    // Szukamy najwyższego bloku w tej kolumnie
-    // (Przy bardzo dużych mapach można to zoptymalizować, ale przy <10k bloków pętla jest ok)
+    // Sprawdzamy każdy blok w pamięci
+    // Blok ma szerokość 1.0 i jest wyśrodkowany na swoich koordynatach.
+    // Czyli blok na x=0.5 zajmuje przestrzeń od 0.0 do 1.0.
     for (const block of nexusBlocksCache) {
-        if (Math.round(block.x) === gridX && Math.round(block.z) === gridZ) {
+        // Sprawdzamy czy punkt (x, z) gracza mieści się w obrysie bloku
+        // Margines 0.5 w każdą stronę od środka bloku
+        if (Math.abs(x - block.x) < 0.5 && Math.abs(z - block.z) < 0.5) {
             if (block.y > highestY) {
                 highestY = block.y;
                 foundBlock = true;
@@ -68,12 +66,14 @@ function getSafeY(x, z) {
     }
 
     if (foundBlock) {
-        // Blok ma środek w Y. Jego góra to Y + 0.5.
-        // Dodajemy 1.5, aby gracz spadł na blok, a nie utknął w nim.
-        return highestY + 1.5; 
+        // block.y to środek bloku. Góra bloku to block.y + 0.5.
+        // Dodajemy 2.5 jednostki zapasu, żeby gracz zrespil się w powietrzu i spadł na blok.
+        return highestY + 0.5 + 2.5; 
     } else {
-        // Jeśli nie ma bloku, spawnuje na domyślnej wysokości (np. na podłodze szachownicy)
-        return 1.0;
+        // Jeśli pod graczem jest pustka (dziura w mapie), 
+        // spawnujemy go na bezpiecznej wysokości domyślnej (np. 5.0), żeby nie spadł w nieskończoność od razu
+        // lub na poziomie 0, jeśli zakładamy że tam jest "niewidzialna podłoga"
+        return 5.0;
     }
 }
 
@@ -89,7 +89,6 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-// Keep-Alive dla WebSocketów (zapobiega rozłączaniu na Render)
 const interval = setInterval(function ping() {
   wss.clients.forEach(function each(ws) {
     if (ws.isAlive === false) return ws.terminate();
@@ -116,7 +115,6 @@ app.get('/api/init-database', async (req, res) => {
     await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
     
-    // Po inicjalizacji bazy, załaduj mapę
     await loadNexusMapToMemory();
 
     res.status(200).send('Baza danych zaktualizowana.');
@@ -128,13 +126,12 @@ app.get('/api/init-database', async (req, res) => {
 // --- NEXUS ENDPOINTS ---
 app.get('/api/nexus', async (req, res) => {
     try {
-        // Zwracamy z cache (szybciej) lub z bazy
         if (nexusBlocksCache.length > 0) {
             res.json(nexusBlocksCache);
         } else {
             const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
             if (result.rows.length > 0) {
-                nexusBlocksCache = result.rows[0].map_data; // Aktualizuj cache przy okazji
+                nexusBlocksCache = result.rows[0].map_data;
                 res.json(result.rows[0].map_data);
             } else {
                 res.status(404).json({ message: 'Brak niestandardowego Nexusa' });
@@ -160,11 +157,8 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
             [JSON.stringify(blocks)]
         );
         
-        // Aktualizuj cache w pamięci natychmiast po zapisie
         nexusBlocksCache = blocks;
         console.log(`[Server] Nexus zaktualizowany i przeładowany w pamięci.`);
-
-        // Opcjonalnie: Wyślij info do graczy, że mapa się zmieniła (tu tego nie robimy, wymagałoby przeładowania klienta)
         
         res.json({ message: 'Nexus zaktualizowany pomyślnie!' });
     } catch (e) {
@@ -203,7 +197,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// ... (Pozostałe endpointy API bez zmian: thumbnail, skins, worlds, friends, coins, messages) ...
+// ... (API bez zmian) ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => {
     try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); }
 });
@@ -224,7 +218,7 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => { try { con
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT DISTINCT ON (other_user_id) other_user_id, other_username, message_text, created_at FROM (SELECT CASE WHEN sender_id=$1 THEN recipient_id ELSE sender_id END as other_user_id, m.message_text, m.created_at FROM private_messages m WHERE m.sender_id=$1 OR m.recipient_id=$1 ORDER BY m.created_at DESC) AS sub JOIN users u ON u.id = sub.other_user_id GROUP BY other_user_id, other_username, message_text, created_at ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const u = await pool.query('SELECT id FROM users WHERE username = $1', [req.params.username]); if (u.rows.length === 0) return res.status(404).json({ message: 'Brak.' }); const m = await pool.query(`SELECT m.id, m.sender_id, u.username as sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (sender_id=$1 AND recipient_id=$2) OR (sender_id=$2 AND recipient_id=$1) ORDER BY m.created_at ASC`, [req.user.userId, u.rows[0].id]); res.json(m.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// --- WEBSOCKET (POKOJE) ---
+// --- WEBSOCKET ---
 
 function broadcastToWorld(worldId, data, excludeId = null) {
     const msg = JSON.stringify(data);
@@ -237,15 +231,11 @@ function broadcastToWorld(worldId, data, excludeId = null) {
 
 function spawnCoin() {
     if (currentCoin) return;
-    
-    // Losujemy X i Z
     const x = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
     const z = (Math.random() - 0.5) * 2 * MAP_BOUNDS;
-    
-    // Obliczamy bezpieczną wysokość na podstawie mapy!
     const safeY = getSafeY(x, z);
     
-    // Ustawiamy monetę lekko nad blokiem
+    // Moneta też spada na blok
     currentCoin = { position: { x, y: safeY, z } };
     
     broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position });
@@ -278,19 +268,19 @@ wss.on('connection', (ws, req) => {
         const username = decoded.username;
         console.log(`[WS] ${username} online.`);
         
-        // Losowanie pozycji startowej
-        const startX = (Math.random() * 6) - 3; // Blisko środka
+        // Losujemy pozycję na środku mapy
+        const startX = (Math.random() * 6) - 3;
         const startZ = (Math.random() * 6) - 3;
         
-        // DYNAMICZNY SPAWN: Pobieramy wysokość terenu w tym miejscu
-        const startY = getSafeY(startX, startZ) + 2.0; // +2 extra żeby spaść na blok
+        // OBLICZAMY WYSOKOŚĆ (najwyższy blok + 2.5 jednostki)
+        const startY = getSafeY(startX, startZ);
 
         players.set(playerId, { 
             ws, id: playerId, nickname: username, 
             skinData: null, thumbnail: null, 
             position: { x: startX, y: startY, z: startZ }, 
             quaternion: { _x:0,_y:0,_z:0,_w:1 },
-            currentWorld: 'nexus' // Domyślnie Nexus
+            currentWorld: 'nexus'
         });
 
         notifyFriendsStatus(playerId, true);
@@ -320,12 +310,11 @@ wss.on('connection', (ws, req) => {
                         broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId);
                         p.currentWorld = newWorld;
                         
-                        // Reset pozycji przy zmianie świata
-                        // Jeśli wraca do Nexusa, użyj bezpiecznej wysokości 
+                        // Reset pozycji: w Nexusie na górze, w innych światach default
                         if (newWorld === 'nexus') {
-                            p.position = { x: 0, y: getSafeY(0, 0) + 5, z: 0 };
+                            p.position = { x: 0, y: getSafeY(0, 0), z: 0 };
                         } else {
-                            p.position = { x: 0, y: 5, z: 0 }; // Dla innych światów default
+                            p.position = { x: 0, y: 5, z: 0 };
                         }
                         
                         const roomPlayers = [];
@@ -379,7 +368,6 @@ wss.on('connection', (ws, req) => {
                     }
                 }
                 if (data.type === 'sendPrivateMessage') {
-                    // ... (obsługa wiadomości prywatnych bez zmian)
                     const { recipient: recipientName, text } = data;
                     try {
                         const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]);
@@ -404,10 +392,7 @@ wss.on('connection', (ws, req) => {
 
 server.listen(port, () => {
   console.log(`Serwer: ${port}`);
-  
-  // Załaduj mapę przy starcie
   loadNexusMapToMemory();
-  
   setTimeout(spawnCoin, 10000);
   const RENDER_URL = process.env.RENDER_EXTERNAL_URL;
   if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000);
