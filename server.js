@@ -101,10 +101,7 @@ app.get('/api/init-database', async (req, res) => {
     await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, coins INTEGER DEFAULT 0 NOT NULL, current_skin_thumbnail TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`);
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`);
-    
-    // NOWE: Kolumna na posiadane bloki (JSONB)
     await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`);
-
     await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
     await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
     await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
@@ -113,11 +110,21 @@ app.get('/api/init-database', async (req, res) => {
     
     await loadNexusMapToMemory();
 
-    res.status(200).send('Baza danych zaktualizowana (dodano owned_blocks).');
+    res.status(200).send('Baza danych zaktualizowana.');
   } catch (err) {
     res.status(500).send('Błąd serwera: ' + err.message);
   }
 });
+
+// --- HELPER: Parse owned blocks ---
+function parseOwnedBlocks(dbValue) {
+    if (!dbValue) return ["Ziemia"];
+    if (Array.isArray(dbValue)) return dbValue;
+    if (typeof dbValue === 'string') {
+        try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; }
+    }
+    return ["Ziemia"];
+}
 
 // --- API ENDPOINTS ---
 
@@ -149,7 +156,6 @@ app.post('/api/register', async (req, res) => {
   if (!username || !password) return res.status(400).json({ message: 'Brak danych.' });
   try {
     const hash = await bcrypt.hash(password, 10);
-    // Domyślnie dodajemy 'Ziemia' do owned_blocks
     await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb)`, [username, hash]);
     res.status(201).json({ message: 'Utworzono.' });
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -163,15 +169,12 @@ app.post('/api/login', async (req, res) => {
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
     const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
     
-    // Zwracamy też owned_blocks
+    // Zawsze zwracaj tablicę
+    const blocks = parseOwnedBlocks(u.owned_blocks);
+    
     res.json({ 
         token, 
-        user: { 
-            id: u.id, 
-            username: u.username, 
-            coins: u.coins || 0,
-            ownedBlocks: u.owned_blocks || ["Ziemia"] 
-        }, 
+        user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
         thumbnail: u.current_skin_thumbnail 
     });
   } catch (e) { res.status(500).json({ message: e.message }); }
@@ -182,31 +185,28 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks FROM users WHERE id = $1', [req.user.userId]);
         if (r.rows.length === 0) return res.status(404).send();
         const u = r.rows[0];
+        const blocks = parseOwnedBlocks(u.owned_blocks);
         res.json({ 
-            user: { 
-                id: u.id, 
-                username: u.username, 
-                coins: u.coins || 0,
-                ownedBlocks: u.owned_blocks || ["Ziemia"]
-            }, 
+            user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: blocks }, 
             thumbnail: u.current_skin_thumbnail 
         });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- SKLEP: KUPNO BLOKU ---
+// --- SKLEP: KUPNO BLOKU (POPRAWIONE) ---
 app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     const { blockName, cost } = req.body;
     const userId = req.user.userId;
 
     try {
-        // 1. Pobierz aktualny stan użytkownika
         const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]);
         if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" });
         
         const user = userResult.rows[0];
         const currentCoins = user.coins || 0;
-        let ownedBlocks = user.owned_blocks || [];
+        
+        // 1. Bezpieczne parsowanie posiadanych bloków
+        let ownedBlocks = parseOwnedBlocks(user.owned_blocks);
 
         // 2. Walidacja
         if (ownedBlocks.includes(blockName)) {
@@ -216,16 +216,17 @@ app.post('/api/shop/buy', authenticateToken, async (req, res) => {
             return res.status(400).json({ message: "Za mało monet!" });
         }
 
-        // 3. Aktualizacja bazy (odejmij monety, dodaj blok)
+        // 3. Aktualizacja
         ownedBlocks.push(blockName);
         const newBalance = currentCoins - cost;
 
+        // Zapisujemy jako JSON string, żeby Postgres na pewno to zrozumiał
         await pool.query(
             'UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3',
             [newBalance, JSON.stringify(ownedBlocks), userId]
         );
 
-        // 4. Sukces
+        // 4. Zwracamy czystą tablicę do klienta
         res.json({ 
             success: true, 
             newBalance: newBalance, 
@@ -238,7 +239,7 @@ app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     }
 });
 
-// ... (Reszta API: coins/update, skins, worlds, friends, messages - bez zmian) ...
+// ... (Reszta API bez zmian: coins/update, skins, worlds, friends, messages) ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
