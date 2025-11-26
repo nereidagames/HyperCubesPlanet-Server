@@ -47,16 +47,14 @@ async function loadNexusMapToMemory() {
 }
 
 // --- INTELIGENTNY SYSTEM SPAWNU ---
-// Zwraca obiekt { x, y, z } - poprawioną pozycję
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
 
-    // Promień szukania bloku pod nogami (0.6 to trochę więcej niż pół bloku)
+    // Szukamy bloku pod podanymi współrzędnymi
     const searchRadius = 0.6;
 
     for (const block of nexusBlocksCache) {
-        // Sprawdzamy, czy wylosowany punkt jest nad tym blokiem
         if (Math.abs(targetX - block.x) < searchRadius && Math.abs(targetZ - block.z) < searchRadius) {
             if (block.y > highestY) {
                 highestY = block.y;
@@ -66,22 +64,21 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     }
 
     if (highestBlock) {
-        // ZNALEZIONO BLOK!
-        // Kluczowa zmiana: Ustawiamy X i Z na środek znalezionego bloku.
-        // To eliminuje wpadanie w szczeliny między 4 blokami.
-        
-        const safeY = highestY + 0.5 + (isPlayer ? 2.0 : 0.8); // +0.5 to góra bloku, +2.0 to zrzut gracza, +0.8 to lewitacja monety
+        // Znaleziono blok.
+        // Jeśli to gracz -> spawnujemy 20 metrów nad blokiem (żeby spadł)
+        // Jeśli to moneta -> spawnujemy 0.8 metra nad blokiem (żeby leżała)
+        const offset = isPlayer ? 20.0 : 0.8; 
         
         return {
-            x: highestBlock.x, // Snap to grid
-            y: safeY,
-            z: highestBlock.z  // Snap to grid
+            x: highestBlock.x, // Wyrównanie do środka bloku
+            y: highestY + 0.5 + offset,
+            z: highestBlock.z  // Wyrównanie do środka bloku
         };
     } else {
-        // Brak bloku (dziura) - spawnuje wysoko, żeby spaść (dla gracza) lub domyślnie (dla monety)
+        // Brak bloku (dziura)
         return {
             x: targetX,
-            y: isPlayer ? 20.0 : 1.0, 
+            y: isPlayer ? 40.0 : 1.0, // Jeszcze wyżej dla gracza w przypadku dziury
             z: targetZ
         };
     }
@@ -246,7 +243,7 @@ function spawnCoin() {
     const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5;
     
-    // Używamy getSmartSpawnPosition, żeby moneta "snapowała" do bloków
+    // Używamy getSmartSpawnPosition (isPlayer = false)
     const pos = getSmartSpawnPosition(x, z, false);
     
     currentCoin = { position: pos };
@@ -285,7 +282,7 @@ wss.on('connection', (ws, req) => {
         const startX = Math.floor((Math.random() * 6) - 3) + 0.5;
         const startZ = Math.floor((Math.random() * 6) - 3) + 0.5;
         
-        // DYNAMICZNY SPAWN (isPlayer = true)
+        // DYNAMICZNY SPAWN (isPlayer = true) -> 20m w górę
         const pos = getSmartSpawnPosition(startX, startZ, true);
 
         players.set(playerId, { 
