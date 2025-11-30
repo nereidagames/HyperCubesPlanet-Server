@@ -12,6 +12,7 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
+// CORS: Pozwalamy na dostęp z każdego miejsca (do testów lokalnych i produkcji)
 app.use(cors({ origin: '*' })); 
 app.use(express.json({ limit: '50mb' })); 
 
@@ -28,8 +29,6 @@ let currentCoin = null;
 const MAP_BOUNDS = 30;
 
 // --- KONFIGURACJA POZIOMÓW (XP TABLE) ---
-// Ilość XP potrzebna, aby przejść Z danego poziomu NA następny.
-// Np. index 0 (Level 1) wymaga 50 XP, aby wbić Level 2.
 const XP_TABLE = [
     50,    // Lvl 1 -> 2
     75,    // Lvl 2 -> 3
@@ -43,12 +42,11 @@ const XP_TABLE = [
     4000   // Lvl 10 -> 11
 ];
 
-// Funkcja pomocnicza: Obliczanie XP na wyższe poziomy (powyżej 10)
 function getXpForNextLevel(currentLevel) {
     if (currentLevel <= XP_TABLE.length) {
         return XP_TABLE[currentLevel - 1];
     }
-    // Dla wyższych poziomów: każdy kolejny wymaga o 1000 więcej niż poprzedni (przykładowa logika)
+    // Dla wyższych poziomów (powyżej 10)
     return 4000 + ((currentLevel - 10) * 1000);
 }
 
@@ -135,11 +133,10 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
+        // Dodawanie kolumn (jeśli nie istnieją)
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
-        
-        // --- NOWE KOLUMNY DLA POZIOMÓW ---
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER DEFAULT 1;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`); } catch(e){}
 
@@ -174,6 +171,7 @@ function parseOwnedBlocks(dbValue) {
 }
 
 // --- API ENDPOINTS ---
+
 app.get('/api/nexus', async (req, res) => {
     try {
         if (nexusBlocksCache.length > 0) res.json(nexusBlocksCache);
@@ -212,9 +210,8 @@ app.post('/api/login', async (req, res) => {
     const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
     const u = r.rows[0];
     if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
-    const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
     
-    // Obliczamy maxXP dla obecnego poziomu, aby klient wiedział jak rysować pasek
+    const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
     const nextLevelXp = getXpForNextLevel(u.level || 1);
     
     res.json({ 
@@ -239,7 +236,6 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
         if (r.rows.length === 0) return res.status(404).send();
         const u = r.rows[0];
         const nextLevelXp = getXpForNextLevel(u.level || 1);
-        
         res.json({ 
             user: { 
                 id: u.id, 
@@ -255,14 +251,12 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- NOWY ENDPOINT: UKOŃCZENIE PARKOURA ---
+// --- ENDPOINT NAGRODY PARKOUR ---
 app.post('/api/parkour/complete', authenticateToken, async (req, res) => {
     const userId = req.user.userId;
     const rewardCoins = 100;
-    const rewardXp = 500; // Zgodnie z Twoim życzeniem
-
+    const rewardXp = 500;
     try {
-        // Pobierz aktualny stan gracza
         const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]);
         if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." });
         
@@ -272,8 +266,6 @@ app.post('/api/parkour/complete', authenticateToken, async (req, res) => {
         level = level || 1;
 
         let levelUpOccurred = false;
-
-        // Pętla awansu (gdyby gracz zdobył tyle XP, że wbije kilka poziomów naraz)
         while (true) {
             const needed = getXpForNextLevel(level);
             if (xp >= needed) {
@@ -285,25 +277,19 @@ app.post('/api/parkour/complete', authenticateToken, async (req, res) => {
             }
         }
 
-        // Zapisz w bazie
         await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3 WHERE id = $4', [coins, level, xp, userId]);
-
         const nextLevelXp = getXpForNextLevel(level);
-
-        res.json({
-            success: true,
-            levelUp: levelUpOccurred,
-            newCoins: coins,
-            newLevel: level,
-            newXp: xp,
-            maxXp: nextLevelXp,
-            message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!`
+        
+        res.json({ 
+            success: true, 
+            levelUp: levelUpOccurred, 
+            newCoins: coins, 
+            newLevel: level, 
+            newXp: xp, 
+            maxXp: nextLevelXp, 
+            message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` 
         });
-
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ message: "Błąd serwera przy nagrodzie." });
-    }
+    } catch (e) { res.status(500).json({ message: "Błąd serwera przy nagrodzie." }); }
 });
 
 app.post('/api/shop/buy', authenticateToken, async (req, res) => {
@@ -324,68 +310,40 @@ app.post('/api/shop/buy', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); }
 });
 
-// ... POZOSTAŁE ENDPOINTY (SKINY, ŚWIATA, PRZYJACIELE, WIADOMOŚCI) BEZ ZMIAN ...
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT s.id, s.name, s.thumbnail, s.owner_id, u.username as creator FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
+
+// --- POBIERANIE ŚWIATÓW Z TYPEM ---
+app.get('/api/worlds/all', authenticateToken, async (req, res) => { 
+    try { 
+        const r = await pool.query(`
+            SELECT 
+                w.id, 
+                w.name, 
+                w.thumbnail, 
+                w.owner_id, 
+                u.username as creator,
+                w.world_data->>'type' as type 
+            FROM worlds w 
+            JOIN users u ON w.owner_id = u.id 
+            ORDER BY w.created_at DESC LIMIT 50
+        `); 
+        res.json(r.rows); 
+    } catch (e) { res.status(500).json({ message: e.message }); } 
+});
+
 app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/friends', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT u.id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = (CASE WHEN f.user_id1 = $1 THEN f.user_id2 ELSE f.user_id1 END) WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`, [req.user.userId]); const reqs = await pool.query(`SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [req.user.userId]); const friends = r.rows.map(f => ({ ...f, isOnline: players.has(f.id) })); res.json({ friends, requests: reqs.rows }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/search', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, username, current_skin_thumbnail FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10`, [`%${req.body.query}%`, req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/request', authenticateToken, async (req, res) => { const { targetUserId } = req.body; if(req.user.userId === targetUserId) return res.status(400).json({message: "Błąd."}); try { const chk = await pool.query(`SELECT * FROM friendships WHERE (user_id1=$1 AND user_id2=$2) OR (user_id1=$2 AND user_id2=$1)`, [req.user.userId, targetUserId]); if(chk.rows.length>0) return res.status(400).json({ message: 'Już istnieje.' }); await pool.query(`INSERT INTO friendships (user_id1, user_id2, status) VALUES ($1, $2, 'pending')`, [req.user.userId, targetUserId]); res.json({ message: 'Wysłano.' }); const t = players.get(parseInt(targetUserId)); if(t && t.ws.readyState===1) t.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username })); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/accept', authenticateToken, async (req, res) => { try { const r = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [req.body.requestId, req.user.userId]); if(r.rowCount===0) return res.status(400).json({ message: 'Błąd.' }); res.json({ message: 'Przyjęto.' }); const sid = r.rows[0].user_id1; const ss = players.get(sid); if(ss && ss.ws.readyState===1){ ss.ws.send(JSON.stringify({ type: 'friendRequestAccepted', by: req.user.username })); ss.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } const ms = players.get(parseInt(req.user.userId)); if(ms) ms.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/coins/update', authenticateToken, async (req, res) => { try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [req.body.amount, req.user.userId]); res.json({ newBalance: r.rows[0].coins }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/messages', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.userId;
-        const query = `
-            SELECT DISTINCT ON (other_user_id)
-                CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id,
-                u.username AS other_username,
-                m.message_text,
-                m.created_at
-            FROM private_messages m
-            JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END)
-            WHERE m.sender_id = $1 OR m.recipient_id = $1
-            ORDER BY other_user_id, m.created_at DESC
-        `;
-        const r = await pool.query(query, [userId]);
-        const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-        res.json(sorted);
-    } catch (e) {
-        console.error("Błąd pobierania wiadomości:", e);
-        res.status(500).json({ message: e.message });
-    }
-});
-app.get('/api/messages/:username', authenticateToken, async (req, res) => {
-    try {
-        const userId = req.user.userId;
-        const targetUsername = req.params.username;
-        const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]);
-        if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' });
-        const targetId = userRes.rows[0].id;
-        const query = `
-            SELECT 
-                m.sender_id,
-                u.username AS sender_username,
-                m.message_text,
-                m.created_at
-            FROM private_messages m
-            JOIN users u ON m.sender_id = u.id
-            WHERE (m.sender_id = $1 AND m.recipient_id = $2)
-               OR (m.sender_id = $2 AND m.recipient_id = $1)
-            ORDER BY m.created_at ASC
-        `;
-        const r = await pool.query(query, [userId, targetId]);
-        res.json(r.rows);
-    } catch (e) {
-        console.error("Błąd historii wiadomości:", e);
-        res.status(500).json({ message: e.message });
-    }
-});
+app.get('/api/messages', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const query = `SELECT DISTINCT ON (other_user_id) CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id, u.username AS other_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END) WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY other_user_id, m.created_at DESC`; const r = await pool.query(query, [userId]); const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); res.json(sorted); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const targetUsername = req.params.username; const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]); if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' }); const targetId = userRes.rows[0].id; const query = `SELECT m.sender_id, u.username AS sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) ORDER BY m.created_at ASC`; const r = await pool.query(query, [userId, targetId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
 function broadcastToWorld(worldId, data, excludeId = null) { const msg = JSON.stringify(data); players.forEach((p, id) => { if (p.currentWorld === worldId && id !== excludeId && p.ws.readyState === 1) { p.ws.send(msg); } }); }
 function spawnCoin() { if (currentCoin) return; const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const pos = getSmartSpawnPosition(x, z, false); currentCoin = { position: pos }; broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position }); }
@@ -398,50 +356,10 @@ wss.on('connection', (ws, req) => {
         if (err) { ws.close(1008); return; }
         const playerId = parseInt(decoded.userId); const username = decoded.username; console.log(`[WS] ${username} online.`);
         let pos = { x: 0, y: 30, z: 0 };
-        players.set(playerId, { 
-            ws, id: playerId, nickname: username, 
-            skinData: null, thumbnail: null, 
-            position: pos, 
-            quaternion: { _x:0,_y:0,_z:0,_w:1 }, 
-            currentWorld: 'nexus' 
-        });
+        players.set(playerId, { ws, id: playerId, nickname: username, skinData: null, thumbnail: null, position: pos, quaternion: { _x:0,_y:0,_z:0,_w:1 }, currentWorld: 'nexus' });
         notifyFriendsStatus(playerId, true);
-        setTimeout(() => { 
-            if (ws.readyState === ws.OPEN) { 
-                const startX = Math.floor((Math.random() * 6) - 3) + 0.5; 
-                const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; 
-                const realPos = getSmartSpawnPosition(startX, startZ, true);
-                const p = players.get(playerId);
-                if(p) p.position = realPos;
-                ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: realPos })); 
-                const nexusPlayers = []; 
-                players.forEach((p, id) => { 
-                    if (id !== playerId && p.currentWorld === 'nexus') { 
-                        nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); 
-                    } 
-                }); 
-                ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); 
-                if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); 
-            } 
-        }, 1500);
-        ws.on('message', async (message) => {
-            try {
-                const data = JSON.parse(message); const p = players.get(playerId); if (!p) return;
-                if (data.type === 'joinWorld') {
-                    const oldWorld = p.currentWorld; const newWorld = data.worldId || 'nexus';
-                    if (oldWorld !== newWorld) {
-                        broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); p.currentWorld = newWorld;
-                        if (newWorld === 'nexus') { p.position = getSmartSpawnPosition(0.5, 0.5, true); } else { p.position = { x: 0, y: 5, z: 0 }; }
-                        const roomPlayers = []; players.forEach((other, oid) => { if (oid !== playerId && other.currentWorld === newWorld) { roomPlayers.push({ id: other.id, nickname: other.nickname, skinData: other.skinData, position: other.position, quaternion: other.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers })); broadcastToWorld(newWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: p.skinData, position: p.position, quaternion: p.quaternion }, playerId); if (newWorld === 'nexus' && currentCoin) { ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); }
-                    } return;
-                }
-                if (data.type === 'playerReady') { p.skinData = data.skinData; broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId); }
-                if (data.type === 'chatMessage') { broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); }
-                if (data.type === 'playerMove') { p.position = data.position; p.quaternion = data.quaternion; broadcastToWorld(p.currentWorld, { type: 'playerMove', id: playerId, position: data.position, quaternion: data.quaternion }, playerId); }
-                if (data.type === 'collectCoin') { if (p.currentWorld === 'nexus' && currentCoin) { currentCoin = null; broadcastToWorld('nexus', { type: 'coinCollected' }); try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + 200 WHERE id = $1 RETURNING coins', [playerId]); if(r.rows.length > 0) ws.send(JSON.stringify({ type: 'updateBalance', newBalance: r.rows[0].coins })); } catch(e) {} setTimeout(spawnCoin, 5000); } }
-                if (data.type === 'sendPrivateMessage') { const { recipient: recipientName, text } = data; try { const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]); if(r.rows.length > 0) { const recipientId = r.rows[0].id; await pool.query('INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)', [playerId, recipientId, text]); ws.send(JSON.stringify({ type: 'privateMessageSent', recipient: recipientName, text })); const rp = players.get(recipientId); if(rp && rp.ws.readyState===1) rp.ws.send(JSON.stringify({ type: 'privateMessageReceived', sender: { id: playerId, nickname: username }, text })); } } catch(e) {} }
-            } catch (e) {}
-        });
+        setTimeout(() => { if (ws.readyState === ws.OPEN) { const startX = Math.floor((Math.random() * 6) - 3) + 0.5; const startZ = Math.floor((Math.random() * 6) - 3) + 0.5; const realPos = getSmartSpawnPosition(startX, startZ, true); const p = players.get(playerId); if(p) p.position = realPos; ws.send(JSON.stringify({ type: 'welcome', id: playerId, username: username, position: realPos })); const nexusPlayers = []; players.forEach((p, id) => { if (id !== playerId && p.currentWorld === 'nexus') { nexusPlayers.push({ id: p.id, nickname: p.nickname, skinData: p.skinData, position: p.position, quaternion: p.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: nexusPlayers })); if (currentCoin) ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); } }, 1500);
+        ws.on('message', async (message) => { try { const data = JSON.parse(message); const p = players.get(playerId); if (!p) return; if (data.type === 'joinWorld') { const oldWorld = p.currentWorld; const newWorld = data.worldId || 'nexus'; if (oldWorld !== newWorld) { broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); p.currentWorld = newWorld; if (newWorld === 'nexus') { p.position = getSmartSpawnPosition(0.5, 0.5, true); } else { p.position = { x: 0, y: 5, z: 0 }; } const roomPlayers = []; players.forEach((other, oid) => { if (oid !== playerId && other.currentWorld === newWorld) { roomPlayers.push({ id: other.id, nickname: other.nickname, skinData: other.skinData, position: other.position, quaternion: other.quaternion }); } }); ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers })); broadcastToWorld(newWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: p.skinData, position: p.position, quaternion: p.quaternion }, playerId); if (newWorld === 'nexus' && currentCoin) { ws.send(JSON.stringify({ type: 'coinSpawned', position: currentCoin.position })); } } return; } if (data.type === 'playerReady') { p.skinData = data.skinData; broadcastToWorld(p.currentWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: data.skinData, position: p.position, quaternion: p.quaternion }, playerId); } if (data.type === 'chatMessage') { broadcastToWorld(p.currentWorld, { type: 'chatMessage', id: playerId, nickname: username, text: data.text }); } if (data.type === 'playerMove') { p.position = data.position; p.quaternion = data.quaternion; broadcastToWorld(p.currentWorld, { type: 'playerMove', id: playerId, position: data.position, quaternion: data.quaternion }, playerId); } if (data.type === 'collectCoin') { if (p.currentWorld === 'nexus' && currentCoin) { currentCoin = null; broadcastToWorld('nexus', { type: 'coinCollected' }); try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + 200 WHERE id = $1 RETURNING coins', [playerId]); if(r.rows.length > 0) ws.send(JSON.stringify({ type: 'updateBalance', newBalance: r.rows[0].coins })); } catch(e) {} setTimeout(spawnCoin, 5000); } } if (data.type === 'sendPrivateMessage') { const { recipient: recipientName, text } = data; try { const r = await pool.query('SELECT id FROM users WHERE username = $1', [recipientName]); if(r.rows.length > 0) { const recipientId = r.rows[0].id; await pool.query('INSERT INTO private_messages (sender_id, recipient_id, message_text) VALUES ($1, $2, $3)', [playerId, recipientId, text]); ws.send(JSON.stringify({ type: 'privateMessageSent', recipient: recipientName, text })); const rp = players.get(recipientId); if(rp && rp.ws.readyState===1) rp.ws.send(JSON.stringify({ type: 'privateMessageReceived', sender: { id: playerId, nickname: username }, text })); } } catch(e) {} } } catch (e) {} });
         ws.on('close', () => { players.delete(playerId); notifyFriendsStatus(playerId, false); broadcastToWorld(players.get(playerId)?.currentWorld || 'nexus', { type: 'playerLeft', id: playerId }); });
     });
 });
