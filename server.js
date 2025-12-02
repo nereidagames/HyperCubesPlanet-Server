@@ -12,7 +12,6 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
-// CORS: Pozwalamy na dostęp z każdego miejsca (do testów lokalnych i produkcji)
 app.use(cors({ origin: '*' })); 
 app.use(express.json({ limit: '50mb' })); 
 
@@ -28,25 +27,10 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
-// --- KONFIGURACJA POZIOMÓW (XP TABLE) ---
-const XP_TABLE = [
-    50,    // Lvl 1 -> 2
-    75,    // Lvl 2 -> 3
-    125,   // Lvl 3 -> 4
-    150,   // Lvl 4 -> 5
-    350,   // Lvl 5 -> 6
-    750,   // Lvl 6 -> 7
-    1500,  // Lvl 7 -> 8
-    2000,  // Lvl 8 -> 9
-    3000,  // Lvl 9 -> 10
-    4000   // Lvl 10 -> 11
-];
-
+// XP Table
+const XP_TABLE = [50, 75, 125, 150, 350, 750, 1500, 2000, 3000, 4000];
 function getXpForNextLevel(currentLevel) {
-    if (currentLevel <= XP_TABLE.length) {
-        return XP_TABLE[currentLevel - 1];
-    }
-    // Dla wyższych poziomów (powyżej 10)
+    if (currentLevel <= XP_TABLE.length) return XP_TABLE[currentLevel - 1];
     return 4000 + ((currentLevel - 10) * 1000);
 }
 
@@ -56,51 +40,27 @@ async function loadNexusMapToMemory() {
     try {
         const tableCheck = await pool.query(`SELECT to_regclass('public.nexus_map');`);
         if (!tableCheck.rows[0].to_regclass) return;
-
         const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
-        if (result.rows.length > 0) {
-            nexusBlocksCache = result.rows[0].map_data || [];
-            console.log(`[Server] Załadowano mapę Nexusa: ${nexusBlocksCache.length} bloków.`);
-        } else {
-            nexusBlocksCache = [];
-        }
-    } catch (e) {
-        console.error("[Server] Błąd cache mapy:", e.message);
-        nexusBlocksCache = [];
-    }
+        if (result.rows.length > 0) nexusBlocksCache = result.rows[0].map_data || [];
+        else nexusBlocksCache = [];
+    } catch (e) { console.error("[Server] Błąd cache mapy:", e.message); nexusBlocksCache = []; }
 }
 
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
     const searchRadius = 0.6; 
-
-    if (nexusBlocksCache.length === 0) {
-        return { x: targetX, y: 30.0, z: targetZ };
-    }
-
+    if (nexusBlocksCache.length === 0) return { x: targetX, y: 30.0, z: targetZ };
     for (const block of nexusBlocksCache) {
         if (Math.abs(targetX - block.x) < searchRadius && Math.abs(targetZ - block.z) < searchRadius) {
-            if (block.y > highestY) {
-                highestY = block.y;
-                highestBlock = block;
-            }
+            if (block.y > highestY) { highestY = block.y; highestBlock = block; }
         }
     }
-
     if (highestBlock) {
         const offset = isPlayer ? 20.0 : 0.8; 
-        return {
-            x: highestBlock.x, 
-            y: highestY + 0.5 + offset, 
-            z: highestBlock.z 
-        };
+        return { x: highestBlock.x, y: highestY + 0.5 + offset, z: highestBlock.z };
     } else {
-        return {
-            x: targetX,
-            y: isPlayer ? 30.0 : 1.0, 
-            z: targetZ
-        };
+        return { x: targetX, y: isPlayer ? 30.0 : 1.0, z: targetZ };
     }
 }
 
@@ -108,7 +68,6 @@ const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
     if (token == null) return res.sendStatus(401);
-
     jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
         if (err) return res.sendStatus(403);
         req.user = user;
@@ -116,8 +75,8 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
-const interval = setInterval(function ping() {
-  wss.clients.forEach(function each(ws) {
+setInterval(() => {
+  wss.clients.forEach((ws) => {
     if (ws.isAlive === false) return ws.terminate();
     ws.isAlive = false;
     ws.ping();
@@ -127,215 +86,106 @@ const interval = setInterval(function ping() {
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
 async function autoMigrate() {
-    console.log("[Server] Sprawdzanie struktury bazy danych...");
+    console.log("[Server] Migracja bazy...");
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
-        // Dodawanie kolumn (jeśli nie istnieją)
+        // Kolumny usera
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER DEFAULT 1;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`); } catch(e){}
 
+        // Tabele
         await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
+        // NOWE TABELE DLA SKINÓW
+        await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) ON DELETE CASCADE, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) ON DELETE CASCADE, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, text TEXT, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
-        if (mapCheck.rowCount === 0) {
-            await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`);
-        }
-
+        if (mapCheck.rowCount === 0) await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`);
         await loadNexusMapToMemory();
-        console.log("[Server] Baza danych gotowa.");
+        console.log("[Server] Baza gotowa.");
+    } catch (e) { console.error("[Server] Migracja błąd:", e.message); }
+}
+
+app.get('/api/init-database', async (req, res) => { await autoMigrate(); res.send("Migracja OK."); });
+function parseOwnedBlocks(dbValue) { if (!dbValue) return ["Ziemia"]; if (Array.isArray(dbValue)) return dbValue; try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; } }
+
+// --- ENDPOINTY ---
+
+// --- SKIN DETAILS & LIKES ---
+app.get('/api/skins/:id/details', authenticateToken, async (req, res) => {
+    const skinId = req.params.id;
+    const userId = req.user.userId;
+    try {
+        // Pobieramy dane skina, twórcę, liczbę lajków, komentarzy i czy user polubił
+        const query = `
+            SELECT 
+                s.id, s.name, s.created_at, s.blocks_data,
+                u.id as creator_id, u.username as creator_name, u.current_skin_thumbnail as creator_thumbnail, u.level as creator_level,
+                (SELECT COUNT(*) FROM skin_likes WHERE skin_id = s.id) as likes_count,
+                (SELECT COUNT(*) FROM skin_comments WHERE skin_id = s.id) as comments_count,
+                EXISTS(SELECT 1 FROM skin_likes WHERE skin_id = s.id AND user_id = $2) as is_liked
+            FROM skins s
+            JOIN users u ON s.owner_id = u.id
+            WHERE s.id = $1
+        `;
+        const r = await pool.query(query, [skinId, userId]);
+        if (r.rows.length === 0) return res.status(404).json({ message: "Skin nie istnieje." });
+        res.json(r.rows[0]);
     } catch (e) {
-        console.error("[Server] Błąd migracji:", e.message);
+        res.status(500).json({ message: e.message });
     }
-}
-
-app.get('/api/init-database', async (req, res) => {
-    await autoMigrate();
-    res.send("Migracja uruchomiona ręcznie.");
 });
 
-function parseOwnedBlocks(dbValue) {
-    if (!dbValue) return ["Ziemia"];
-    if (Array.isArray(dbValue)) return dbValue;
-    if (typeof dbValue === 'string') {
-        try { return JSON.parse(dbValue); } catch (e) { return ["Ziemia"]; }
-    }
-    return ["Ziemia"];
-}
-
-// --- API ENDPOINTS ---
-
-app.get('/api/nexus', async (req, res) => {
-    try {
-        if (nexusBlocksCache.length > 0) res.json(nexusBlocksCache);
-        else {
-            const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
-            if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data; res.json(result.rows[0].map_data); }
-            else res.json([]); 
-        }
-    } catch (e) { res.json([]); }
-});
-
-app.post('/api/nexus', authenticateToken, async (req, res) => {
-    const allowedAdmins = ['admin', 'nixox2']; 
-    if (!allowedAdmins.includes(req.user.username)) return res.status(403).json({ message: "Brak uprawnień!" });
-    const { blocks } = req.body;
-    if (!blocks) return res.status(400).json({ message: "Brak danych." });
-    try {
-        await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]);
-        nexusBlocksCache = blocks;
-        res.json({ message: 'Zapisano!' });
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/register', async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const hash = await bcrypt.hash(password, 10);
-    await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0)`, [username, hash]);
-    res.status(201).json({ message: 'Utworzono.' });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/login', async (req, res) => {
-  const { username, password } = req.body;
-  try {
-    const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-    const u = r.rows[0];
-    if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
-    
-    const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-    const nextLevelXp = getXpForNextLevel(u.level || 1);
-    
-    res.json({ 
-        token, 
-        user: { 
-            id: u.id, 
-            username: u.username, 
-            coins: u.coins || 0, 
-            ownedBlocks: parseOwnedBlocks(u.owned_blocks),
-            level: u.level || 1,
-            xp: u.xp || 0,
-            maxXp: nextLevelXp
-        }, 
-        thumbnail: u.current_skin_thumbnail 
-    });
-  } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/user/me', authenticateToken, async (req, res) => {
-    try {
-        const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp FROM users WHERE id = $1', [req.user.userId]);
-        if (r.rows.length === 0) return res.status(404).send();
-        const u = r.rows[0];
-        const nextLevelXp = getXpForNextLevel(u.level || 1);
-        res.json({ 
-            user: { 
-                id: u.id, 
-                username: u.username, 
-                coins: u.coins || 0, 
-                ownedBlocks: parseOwnedBlocks(u.owned_blocks),
-                level: u.level || 1,
-                xp: u.xp || 0,
-                maxXp: nextLevelXp
-            }, 
-            thumbnail: u.current_skin_thumbnail 
-        });
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-// --- ENDPOINT NAGRODY PARKOUR ---
-app.post('/api/parkour/complete', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    const rewardCoins = 100;
-    const rewardXp = 500;
-    try {
-        const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]);
-        if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." });
-        
-        let { coins, level, xp } = r.rows[0];
-        coins = (coins || 0) + rewardCoins;
-        xp = (xp || 0) + rewardXp;
-        level = level || 1;
-
-        let levelUpOccurred = false;
-        while (true) {
-            const needed = getXpForNextLevel(level);
-            if (xp >= needed) {
-                xp -= needed;
-                level++;
-                levelUpOccurred = true;
-            } else {
-                break;
-            }
-        }
-
-        await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3 WHERE id = $4', [coins, level, xp, userId]);
-        const nextLevelXp = getXpForNextLevel(level);
-        
-        res.json({ 
-            success: true, 
-            levelUp: levelUpOccurred, 
-            newCoins: coins, 
-            newLevel: level, 
-            newXp: xp, 
-            maxXp: nextLevelXp, 
-            message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` 
-        });
-    } catch (e) { res.status(500).json({ message: "Błąd serwera przy nagrodzie." }); }
-});
-
-app.post('/api/shop/buy', authenticateToken, async (req, res) => {
-    const { blockName, cost } = req.body;
+app.post('/api/skins/:id/like', authenticateToken, async (req, res) => {
+    const skinId = req.params.id;
     const userId = req.user.userId;
     try {
-        const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]);
-        if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" });
-        const user = userResult.rows[0];
-        const currentCoins = user.coins || 0;
-        let ownedBlocks = parseOwnedBlocks(user.owned_blocks);
-        if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" });
-        if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" });
-        ownedBlocks.push(blockName);
-        const newBalance = currentCoins - cost;
-        await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]);
-        res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks });
-    } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); }
+        // Sprawdź czy już polubione
+        const check = await pool.query('SELECT id FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
+        let isLiked = false;
+        
+        if (check.rows.length > 0) {
+            // Usuń lajka (unlike)
+            await pool.query('DELETE FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
+            isLiked = false;
+        } else {
+            // Dodaj lajka
+            await pool.query('INSERT INTO skin_likes (skin_id, user_id) VALUES ($1, $2)', [skinId, userId]);
+            isLiked = true;
+        }
+        
+        // Pobierz nową liczbę
+        const countRes = await pool.query('SELECT COUNT(*) as count FROM skin_likes WHERE skin_id = $1', [skinId]);
+        res.json({ success: true, isLiked: isLiked, newCount: countRes.rows[0].count });
+    } catch (e) {
+        res.status(500).json({ message: e.message });
+    }
 });
 
+// ... (REST STANDARDOWYCH ENDPOINTÓW BEZ ZMIAN) ...
+app.get('/api/nexus', async (req, res) => { try { if (nexusBlocksCache.length > 0) res.json(nexusBlocksCache); else { const r = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1'); if (r.rows.length > 0) { nexusBlocksCache = r.rows[0].map_data; res.json(r.rows[0].map_data); } else res.json([]); } } catch (e) { res.json([]); } });
+app.post('/api/nexus', authenticateToken, async (req, res) => { const allowed=['admin','nixox2']; if(!allowed.includes(req.user.username))return res.sendStatus(403); try{ await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`,[JSON.stringify(req.body.blocks)]); nexusBlocksCache=req.body.blocks; res.json({message:'Zapisano'}); }catch(e){res.status(500).json({message:e.message});} });
+app.post('/api/register', async (req, res) => { try { const h = await bcrypt.hash(req.body.password, 10); await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0)`, [req.body.username, h]); res.status(201).json({ message: 'OK' }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.post('/api/login', async (req, res) => { try { const r = await pool.query('SELECT * FROM users WHERE username = $1', [req.body.username]); const u = r.rows[0]; if (!u || !(await bcrypt.compare(req.body.password, u.password_hash))) return res.status(401).json({ message: 'Błąd' }); const t = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' }); res.json({ token: t, user: { id: u.id, username: u.username, coins: u.coins||0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level||1, xp: u.xp||0, maxXp: getXpForNextLevel(u.level||1) }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/user/me', authenticateToken, async (req, res) => { try { const r = await pool.query('SELECT * FROM users WHERE id = $1', [req.user.userId]); if (r.rowCount===0) return res.sendStatus(404); const u = r.rows[0]; res.json({ user: { id: u.id, username: u.username, coins: u.coins||0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level||1, xp: u.xp||0, maxXp: getXpForNextLevel(u.level||1) }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.post('/api/parkour/complete', authenticateToken, async (req, res) => { const uid=req.user.userId; try { const r=await pool.query('SELECT coins, level, xp FROM users WHERE id=$1',[uid]); let {coins,level,xp}=r.rows[0]; coins+=100; xp+=500; level=level||1; let up=false; while(true){ const n=getXpForNextLevel(level); if(xp>=n){xp-=n; level++; up=true;}else break; } await pool.query('UPDATE users SET coins=$1, level=$2, xp=$3 WHERE id=$4',[coins,level,xp,uid]); res.json({success:true, levelUp:up, newCoins:coins, newLevel:level, newXp:xp, maxXp:getXpForNextLevel(level), message: up?`Awans na ${level}!`:`Zdobyto nagrodę!`}); } catch(e){res.status(500).json({message:"Błąd"});} });
+app.post('/api/shop/buy', authenticateToken, async (req, res) => { try { const {blockName,cost}=req.body; const r=await pool.query('SELECT coins, owned_blocks FROM users WHERE id=$1',[req.user.userId]); const u=r.rows[0]; let obs=parseOwnedBlocks(u.owned_blocks); if(obs.includes(blockName))return res.status(400).json({message:"Masz to"}); if(u.coins<cost)return res.status(400).json({message:"Bieda"}); obs.push(blockName); const nc=u.coins-cost; await pool.query('UPDATE users SET coins=$1, owned_blocks=$2 WHERE id=$3',[nc,JSON.stringify(obs),req.user.userId]); res.json({success:true, newBalance:nc, ownedBlocks:obs}); } catch(e){res.status(500).json({message:"Błąd"});} });
 app.post('/api/user/thumbnail', authenticateToken, async (req, res) => { try { await pool.query('UPDATE users SET current_skin_thumbnail = $1 WHERE id = $2', [req.body.thumbnail, req.user.userId]); const p = players.get(parseInt(req.user.userId)); if (p) p.thumbnail = req.body.thumbnail; res.sendStatus(200); } catch (e) { res.sendStatus(500); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, name, thumbnail, owner_id, created_at FROM skins WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT s.id, s.name, s.thumbnail, s.owner_id, u.username as creator FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-
-// --- POBIERANIE ŚWIATÓW Z TYPEM ---
-app.get('/api/worlds/all', authenticateToken, async (req, res) => { 
-    try { 
-        const r = await pool.query(`
-            SELECT 
-                w.id, 
-                w.name, 
-                w.thumbnail, 
-                w.owner_id, 
-                u.username as creator,
-                w.world_data->>'type' as type 
-            FROM worlds w 
-            JOIN users u ON w.owner_id = u.id 
-            ORDER BY w.created_at DESC LIMIT 50
-        `); 
-        res.json(r.rows); 
-    } catch (e) { res.status(500).json({ message: e.message }); } 
-});
-
+app.post('/api/worlds', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.world_data), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator, w.world_data->>'type' as type FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/friends', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT u.id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = (CASE WHEN f.user_id1 = $1 THEN f.user_id2 ELSE f.user_id1 END) WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`, [req.user.userId]); const reqs = await pool.query(`SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [req.user.userId]); const friends = r.rows.map(f => ({ ...f, isOnline: players.has(f.id) })); res.json({ friends, requests: reqs.rows }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/search', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, username, current_skin_thumbnail FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10`, [`%${req.body.query}%`, req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -354,7 +204,7 @@ wss.on('connection', (ws, req) => {
     const url = new URL(req.url, `http://${req.headers.host}`); const token = url.searchParams.get('token'); if (!token) { ws.close(1008); return; }
     jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
         if (err) { ws.close(1008); return; }
-        const playerId = parseInt(decoded.userId); const username = decoded.username; console.log(`[WS] ${username} online.`);
+        const playerId = parseInt(decoded.userId); const username = decoded.username; 
         let pos = { x: 0, y: 30, z: 0 };
         players.set(playerId, { ws, id: playerId, nickname: username, skinData: null, thumbnail: null, position: pos, quaternion: { _x:0,_y:0,_z:0,_w:1 }, currentWorld: 'nexus' });
         notifyFriendsStatus(playerId, true);
@@ -364,11 +214,4 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(port, () => { 
-    console.log(`Serwer: ${port}`); 
-    autoMigrate(); 
-    loadNexusMapToMemory(); 
-    setTimeout(spawnCoin, 10000); 
-    const RENDER_URL = process.env.RENDER_EXTERNAL_URL; 
-    if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); 
-});
+server.listen(port, () => { console.log(`Serwer: ${port}`); autoMigrate(); loadNexusMapToMemory(); setTimeout(spawnCoin, 10000); const RENDER_URL = process.env.RENDER_EXTERNAL_URL; if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); });
