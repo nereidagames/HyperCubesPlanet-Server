@@ -27,7 +27,7 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
-// --- KONFIGURACJA POZIOMÓW (XP TABLE) ---
+// --- XP TABLE ---
 const XP_TABLE = [
     50, 75, 125, 150, 350, 750, 1500, 2000, 3000, 4000
 ];
@@ -131,8 +131,6 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-        
-        // --- NOWA TABELA LAJKÓW ---
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
 
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
@@ -163,41 +161,15 @@ function parseOwnedBlocks(dbValue) {
 
 // --- API ENDPOINTS ---
 
-// --- NOWY ENDPOINT: LAJKOWANIE ---
-app.post('/api/skins/:id/like', authenticateToken, async (req, res) => {
-    const skinId = req.params.id;
-    const userId = req.user.userId;
-    try {
-        // Sprawdź czy już polubione
-        const check = await pool.query('SELECT id FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
-        
-        if (check.rows.length > 0) {
-            // Jeśli jest, usuń (unlike)
-            await pool.query('DELETE FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
-        } else {
-            // Jeśli nie ma, dodaj (like)
-            await pool.query('INSERT INTO skin_likes (skin_id, user_id) VALUES ($1, $2)', [skinId, userId]);
-        }
-
-        // Zwróć nową liczbę lajków
-        const countRes = await pool.query('SELECT COUNT(*) FROM skin_likes WHERE skin_id = $1', [skinId]);
-        res.json({ success: true, likes: countRes.rows[0].count });
-
-    } catch (e) {
-        console.error(e);
-        res.status(500).json({ message: "Błąd bazy danych." });
-    }
-});
-
-// --- ZMODYFIKOWANY ENDPOINT: POBIERANIE SKINÓW Z LICZBĄ LAJKÓW ---
+// --- FIX: ZAKTUALIZOWANE POBIERANIE SKINÓW (DODAJE LEVEL I THUMBNAIL TWORCY) ---
 app.get('/api/skins/all', authenticateToken, async (req, res) => { 
     try { 
-        // Dołączamy liczbę lajków (podzapytanie)
         const query = `
             SELECT 
                 s.id, s.name, s.thumbnail, s.owner_id, 
                 u.username as creator, 
                 u.level as creatorLevel,
+                u.current_skin_thumbnail as creatorThumbnail,
                 (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes
             FROM skins s 
             JOIN users u ON s.owner_id = u.id 
@@ -207,15 +179,19 @@ app.get('/api/skins/all', authenticateToken, async (req, res) => {
         res.json(r.rows); 
     } catch (e) { res.status(500).json({ message: e.message }); } 
 });
-// To samo dla 'mine'
+
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { 
     try { 
         const query = `
             SELECT 
                 s.id, s.name, s.thumbnail, s.owner_id, 
                 s.created_at,
+                u.username as creator,
+                u.level as creatorLevel,
+                u.current_skin_thumbnail as creatorThumbnail,
                 (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes
             FROM skins s 
+            JOIN users u ON s.owner_id = u.id
             WHERE s.owner_id = $1 
             ORDER BY s.created_at DESC
         `;
@@ -224,6 +200,23 @@ app.get('/api/skins/mine', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); } 
 });
 
+app.post('/api/skins/:id/like', authenticateToken, async (req, res) => {
+    const skinId = req.params.id;
+    const userId = req.user.userId;
+    try {
+        const check = await pool.query('SELECT id FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
+        if (check.rows.length > 0) {
+            await pool.query('DELETE FROM skin_likes WHERE skin_id = $1 AND user_id = $2', [skinId, userId]);
+        } else {
+            await pool.query('INSERT INTO skin_likes (skin_id, user_id) VALUES ($1, $2)', [skinId, userId]);
+        }
+        const countRes = await pool.query('SELECT COUNT(*) FROM skin_likes WHERE skin_id = $1', [skinId]);
+        res.json({ success: true, likes: countRes.rows[0].count });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: "Błąd bazy danych." });
+    }
+});
 
 app.get('/api/nexus', async (req, res) => {
     try {
