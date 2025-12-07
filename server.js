@@ -132,8 +132,6 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
-        
-        // --- NOWE TABELE: KOMENTARZE ---
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES skin_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
@@ -165,7 +163,6 @@ function parseOwnedBlocks(dbValue) {
 
 // --- API ENDPOINTS ---
 
-// KOMENTARZE: Pobieranie
 app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => {
     const skinId = req.params.id;
     try {
@@ -184,7 +181,6 @@ app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({message: e.message}); }
 });
 
-// KOMENTARZE: Dodawanie
 app.post('/api/skins/:id/comments', authenticateToken, async (req, res) => {
     const skinId = req.params.id;
     const { text } = req.body;
@@ -195,7 +191,6 @@ app.post('/api/skins/:id/comments', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({message: e.message}); }
 });
 
-// KOMENTARZE: Lajkowanie
 app.post('/api/comments/:id/like', authenticateToken, async (req, res) => {
     const commentId = req.params.id;
     const userId = req.user.userId;
@@ -212,14 +207,15 @@ app.post('/api/comments/:id/like', authenticateToken, async (req, res) => {
 });
 
 
+// --- FIX: WYMUSZAMY NAZWY KOLUMN (CUDZYSŁOWY) ---
 app.get('/api/skins/all', authenticateToken, async (req, res) => { 
     try { 
         const query = `
             SELECT 
                 s.id, s.name, s.thumbnail, s.owner_id, 
                 u.username as creator, 
-                u.level as creatorLevel,
-                u.current_skin_thumbnail as creatorThumbnail,
+                u.level as "creatorLevel",
+                u.current_skin_thumbnail as "creatorThumbnail",
                 (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes,
                 (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments
             FROM skins s 
@@ -238,8 +234,8 @@ app.get('/api/skins/mine', authenticateToken, async (req, res) => {
                 s.id, s.name, s.thumbnail, s.owner_id, 
                 s.created_at,
                 u.username as creator,
-                u.level as creatorLevel,
-                u.current_skin_thumbnail as creatorThumbnail,
+                u.level as "creatorLevel",
+                u.current_skin_thumbnail as "creatorThumbnail",
                 (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes,
                 (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments
             FROM skins s 
