@@ -134,6 +134,10 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES skin_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
+        
+        // --- NOWE TABELE: PREFABRYKATY I CZĘŚCI ---
+        await pool.query(`CREATE TABLE IF NOT EXISTS prefabs (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS hypercube_parts (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
 
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
         if (mapCheck.rowCount === 0) {
@@ -163,6 +167,55 @@ function parseOwnedBlocks(dbValue) {
 
 // --- API ENDPOINTS ---
 
+// --- PREFABRYKATY ---
+app.post('/api/prefabs', authenticateToken, async (req, res) => {
+    try {
+        const { name, blocks, thumbnail } = req.body;
+        const r = await pool.query(`INSERT INTO prefabs (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(blocks), thumbnail]);
+        res.status(201).json({ message: 'Zapisano prefabrykat.', id: r.rows[0].id });
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/prefabs/mine', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT id, name, thumbnail FROM prefabs WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]);
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/prefabs/:id', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT blocks_data FROM prefabs WHERE id = $1`, [req.params.id]);
+        if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' });
+        res.json(r.rows[0].blocks_data);
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// --- CZĘŚCI HYPERCUBE ---
+app.post('/api/parts', authenticateToken, async (req, res) => {
+    try {
+        const { name, blocks, thumbnail } = req.body;
+        const r = await pool.query(`INSERT INTO hypercube_parts (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(blocks), thumbnail]);
+        res.status(201).json({ message: 'Zapisano część.', id: r.rows[0].id });
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/parts/mine', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT id, name, thumbnail FROM hypercube_parts WHERE owner_id = $1 ORDER BY created_at DESC`, [req.user.userId]);
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.get('/api/parts/:id', authenticateToken, async (req, res) => {
+    try {
+        const r = await pool.query(`SELECT blocks_data FROM hypercube_parts WHERE id = $1`, [req.params.id]);
+        if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' });
+        res.json(r.rows[0].blocks_data);
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// --- POZOSTAŁE ENDPOINTY BEZ ZMIAN ---
 app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => {
     const skinId = req.params.id;
     try {
@@ -206,8 +259,6 @@ app.post('/api/comments/:id/like', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({message: e.message}); }
 });
 
-
-// --- FIX: WYMUSZAMY NAZWY KOLUMN (CUDZYSŁOWY) ---
 app.get('/api/skins/all', authenticateToken, async (req, res) => { 
     try { 
         const query = `
