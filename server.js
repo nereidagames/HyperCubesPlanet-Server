@@ -27,7 +27,7 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
-// --- XP TABLE ---
+// --- KONFIGURACJA POZIOMÓW (XP TABLE) ---
 const XP_TABLE = [
     50, 75, 125, 150, 350, 750, 1500, 2000, 3000, 4000
 ];
@@ -132,6 +132,10 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
+        
+        // --- NOWE TABELE: KOMENTARZE ---
+        await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS skin_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES skin_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
         if (mapCheck.rowCount === 0) {
@@ -161,7 +165,53 @@ function parseOwnedBlocks(dbValue) {
 
 // --- API ENDPOINTS ---
 
-// --- FIX: ZAKTUALIZOWANE POBIERANIE SKINÓW (DODAJE LEVEL I THUMBNAIL TWORCY) ---
+// KOMENTARZE: Pobieranie
+app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => {
+    const skinId = req.params.id;
+    try {
+        const query = `
+            SELECT 
+                c.id, c.text, c.created_at, 
+                u.username, u.current_skin_thumbnail,
+                (SELECT COUNT(*) FROM skin_comment_likes l WHERE l.comment_id = c.id) as likes
+            FROM skin_comments c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.skin_id = $1
+            ORDER BY c.created_at DESC
+        `;
+        const r = await pool.query(query, [skinId]);
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({message: e.message}); }
+});
+
+// KOMENTARZE: Dodawanie
+app.post('/api/skins/:id/comments', authenticateToken, async (req, res) => {
+    const skinId = req.params.id;
+    const { text } = req.body;
+    if(!text || text.trim() === "") return res.status(400).json({message: "Pusty komentarz"});
+    try {
+        await pool.query('INSERT INTO skin_comments (skin_id, user_id, text) VALUES ($1, $2, $3)', [skinId, req.user.userId, text]);
+        res.json({success: true});
+    } catch (e) { res.status(500).json({message: e.message}); }
+});
+
+// KOMENTARZE: Lajkowanie
+app.post('/api/comments/:id/like', authenticateToken, async (req, res) => {
+    const commentId = req.params.id;
+    const userId = req.user.userId;
+    try {
+        const check = await pool.query('SELECT id FROM skin_comment_likes WHERE comment_id=$1 AND user_id=$2', [commentId, userId]);
+        if(check.rows.length > 0) {
+            await pool.query('DELETE FROM skin_comment_likes WHERE comment_id=$1 AND user_id=$2', [commentId, userId]);
+        } else {
+            await pool.query('INSERT INTO skin_comment_likes (comment_id, user_id) VALUES ($1, $2)', [commentId, userId]);
+        }
+        const count = await pool.query('SELECT COUNT(*) FROM skin_comment_likes WHERE comment_id=$1', [commentId]);
+        res.json({success: true, likes: count.rows[0].count});
+    } catch (e) { res.status(500).json({message: e.message}); }
+});
+
+
 app.get('/api/skins/all', authenticateToken, async (req, res) => { 
     try { 
         const query = `
@@ -170,7 +220,8 @@ app.get('/api/skins/all', authenticateToken, async (req, res) => {
                 u.username as creator, 
                 u.level as creatorLevel,
                 u.current_skin_thumbnail as creatorThumbnail,
-                (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes
+                (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes,
+                (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments
             FROM skins s 
             JOIN users u ON s.owner_id = u.id 
             ORDER BY s.created_at DESC LIMIT 50
@@ -189,7 +240,8 @@ app.get('/api/skins/mine', authenticateToken, async (req, res) => {
                 u.username as creator,
                 u.level as creatorLevel,
                 u.current_skin_thumbnail as creatorThumbnail,
-                (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes
+                (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes,
+                (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments
             FROM skins s 
             JOIN users u ON s.owner_id = u.id
             WHERE s.owner_id = $1 
