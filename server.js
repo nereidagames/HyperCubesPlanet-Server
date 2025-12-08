@@ -27,7 +27,7 @@ const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
-// --- XP TABLE ---
+// --- KONFIGURACJA POZIOMÓW (XP TABLE) ---
 const XP_TABLE = [
     50, 75, 125, 150, 350, 750, 1500, 2000, 3000, 4000
 ];
@@ -115,19 +115,54 @@ const interval = setInterval(function ping() {
 
 app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
 
+// --- AWARYJNY RESET BAZY DANYCH ---
+// Uruchom to w przeglądarce: /api/hard-reset
+app.get('/api/hard-reset', async (req, res) => {
+    try {
+        console.log("URUCHAMIANIE TWARDEGO RESETU BAZY...");
+        await pool.query(`
+            DROP TABLE IF EXISTS skin_comment_likes CASCADE;
+            DROP TABLE IF EXISTS skin_comments CASCADE;
+            DROP TABLE IF EXISTS skin_likes CASCADE;
+            DROP TABLE IF EXISTS prefab_comment_likes CASCADE;
+            DROP TABLE IF EXISTS prefab_comments CASCADE;
+            DROP TABLE IF EXISTS prefab_likes CASCADE;
+            DROP TABLE IF EXISTS prefabs CASCADE;
+            DROP TABLE IF EXISTS part_comment_likes CASCADE;
+            DROP TABLE IF EXISTS part_comments CASCADE;
+            DROP TABLE IF EXISTS part_likes CASCADE;
+            DROP TABLE IF EXISTS hypercube_parts CASCADE;
+            DROP TABLE IF EXISTS private_messages CASCADE;
+            DROP TABLE IF EXISTS worlds CASCADE;
+            DROP TABLE IF EXISTS friendships CASCADE;
+            DROP TABLE IF EXISTS skins CASCADE;
+            DROP TABLE IF EXISTS nexus_map CASCADE;
+            DROP TABLE IF EXISTS users CASCADE;
+        `);
+        console.log("Tabele usunięte. Tworzenie na nowo...");
+        await autoMigrate();
+        res.send("Baza danych została wyczyszczona i utworzona na nowo! Możesz teraz uruchomić grę.");
+    } catch (e) {
+        console.error(e);
+        res.status(500).send("Błąd resetu: " + e.message);
+    }
+});
+
 async function autoMigrate() {
     console.log("[Server] Sprawdzanie struktury bazy danych...");
     try {
         await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-        await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
-        await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
+        // Dodawanie kolumn - jeśli nie istnieją (dla bezpieczeństwa przy soft-restarcie)
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER DEFAULT 1;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`); } catch(e){}
 
+        await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
+        await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        
         await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
@@ -160,11 +195,6 @@ async function autoMigrate() {
         console.error("[Server] Błąd migracji:", e.message);
     }
 }
-
-app.get('/api/init-database', async (req, res) => {
-    await autoMigrate();
-    res.send("Migracja uruchomiona ręcznie.");
-});
 
 function parseOwnedBlocks(dbValue) {
     if (!dbValue) return ["Ziemia"];
