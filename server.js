@@ -1,4 +1,3 @@
-
 require('dotenv').config();
 
 const express = require('express');
@@ -122,6 +121,7 @@ async function autoMigrate() {
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER DEFAULT 1;`); } catch(e){}
         try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`); } catch(e){}
+        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_xp INTEGER DEFAULT 0;`); } catch(e){}
 
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
@@ -167,8 +167,8 @@ function parseOwnedBlocks(dbValue) {
     return ["Ziemia"];
 }
 
-// HELPERS
-async function handleLike(req, res, tableName, colName) {
+// HELPERS (WITH REWARD LOGIC)
+async function handleLike(req, res, tableName, colName, parentTableName) {
     const objId = req.params.id;
     const userId = req.user.userId;
     try {
@@ -177,10 +177,22 @@ async function handleLike(req, res, tableName, colName) {
             await pool.query(`DELETE FROM ${tableName} WHERE ${colName} = $1 AND user_id = $2`, [objId, userId]);
         } else {
             await pool.query(`INSERT INTO ${tableName} (${colName}, user_id) VALUES ($1, $2)`, [objId, userId]);
+            
+            // Nagroda dla właściciela
+            const ownerRes = await pool.query(`SELECT owner_id FROM ${parentTableName} WHERE id = $1`, [objId]);
+            if (ownerRes.rows.length > 0) {
+                const ownerId = ownerRes.rows[0].owner_id;
+                if (ownerId !== userId) {
+                    await pool.query(`UPDATE users SET pending_xp = pending_xp + 100 WHERE id = $1`, [ownerId]);
+                }
+            }
         }
         const count = await pool.query(`SELECT COUNT(*) FROM ${tableName} WHERE ${colName} = $1`, [objId]);
         res.json({ success: true, likes: count.rows[0].count });
-    } catch (e) { res.status(500).json({ message: "DB Error" }); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({ message: "DB Error" }); 
+    }
 }
 
 async function handleGetComments(req, res, tableName, likesTable, colName) {
@@ -211,7 +223,7 @@ async function handlePostComment(req, res, tableName, colName) {
     } catch (e) { res.status(500).json({message: "DB Error"}); }
 }
 
-async function handleLikeComment(req, res, tableName) {
+async function handleLikeComment(req, res, tableName, commentsTable) {
     const commentId = req.params.id;
     const userId = req.user.userId;
     try {
@@ -220,6 +232,15 @@ async function handleLikeComment(req, res, tableName) {
             await pool.query(`DELETE FROM ${tableName} WHERE comment_id=$1 AND user_id=$2`, [commentId, userId]);
         } else {
             await pool.query(`INSERT INTO ${tableName} (comment_id, user_id) VALUES ($1, $2)`, [commentId, userId]);
+            
+            // Nagroda dla autora komentarza
+            const authorRes = await pool.query(`SELECT user_id FROM ${commentsTable} WHERE id = $1`, [commentId]);
+            if(authorRes.rows.length > 0) {
+                const authorId = authorRes.rows[0].user_id;
+                if(authorId !== userId) {
+                    await pool.query(`UPDATE users SET pending_xp = pending_xp + 50 WHERE id = $1`, [authorId]);
+                }
+            }
         }
         const count = await pool.query(`SELECT COUNT(*) FROM ${tableName} WHERE comment_id=$1`, [commentId]);
         res.json({success: true, likes: count.rows[0].count});
@@ -254,6 +275,46 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
     }
 });
 
+// --- REWARDS CLAIM ---
+app.post('/api/rewards/claim', authenticateToken, async (req, res) => {
+    const userId = req.user.userId;
+    try {
+        const r = await pool.query('SELECT coins, level, xp, pending_xp FROM users WHERE id = $1', [userId]);
+        if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." });
+        
+        let { coins, level, xp, pending_xp } = r.rows[0];
+        const claimedXp = pending_xp || 0;
+        
+        if (claimedXp <= 0) {
+            return res.json({ success: false, message: "Brak nagród do odebrania." });
+        }
+
+        xp = (xp || 0) + claimedXp;
+        const bonusCoins = Math.floor(claimedXp * 0.1); 
+        coins = (coins || 0) + bonusCoins;
+
+        let levelUpOccurred = false;
+        while (true) {
+            const needed = getXpForNextLevel(level);
+            if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; }
+        }
+
+        await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3, pending_xp = 0 WHERE id = $4', [coins, level, xp, userId]);
+        
+        const nextLevelXp = getXpForNextLevel(level);
+        res.json({ 
+            success: true, 
+            claimedXp: claimedXp,
+            bonusCoins: bonusCoins,
+            levelUp: levelUpOccurred, 
+            newCoins: coins, 
+            newLevel: level, 
+            newXp: xp, 
+            maxXp: nextLevelXp 
+        });
+    } catch (e) { res.status(500).json({ message: "Błąd serwera." }); }
+});
+
 // --- SKINY ---
 app.get('/api/skins/all', authenticateToken, async (req, res) => { 
     try { 
@@ -275,10 +336,10 @@ app.get('/api/skins/mine', authenticateToken, async (req, res) => {
 });
 app.get('/api/skins/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/skins', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', skinId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/skins/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'skin_likes', 'skin_id'); });
+app.post('/api/skins/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'skin_likes', 'skin_id', 'skins'); });
 app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => { handleGetComments(req, res, 'skin_comments', 'skin_comment_likes', 'skin_id'); });
 app.post('/api/skins/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'skin_comments', 'skin_id'); });
-app.post('/api/skins/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'skin_comment_likes'); });
+app.post('/api/skins/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'skin_comment_likes', 'skin_comments'); });
 
 // --- PREFABRYKATY ---
 app.get('/api/prefabs/all', authenticateToken, async (req, res) => {
@@ -299,10 +360,10 @@ app.get('/api/prefabs/mine', authenticateToken, async (req, res) => {
 });
 app.get('/api/prefabs/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM prefabs WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/prefabs', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO prefabs (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', id: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/prefabs/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'prefab_likes', 'prefab_id'); });
+app.post('/api/prefabs/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'prefab_likes', 'prefab_id', 'prefabs'); });
 app.get('/api/prefabs/:id/comments', authenticateToken, async (req, res) => { handleGetComments(req, res, 'prefab_comments', 'prefab_comment_likes', 'prefab_id'); });
 app.post('/api/prefabs/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'prefab_comments', 'prefab_id'); });
-app.post('/api/prefabs/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'prefab_comment_likes'); });
+app.post('/api/prefabs/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'prefab_comment_likes', 'prefab_comments'); });
 
 // --- CZĘŚCI ---
 app.get('/api/parts/all', authenticateToken, async (req, res) => {
@@ -323,15 +384,15 @@ app.get('/api/parts/mine', authenticateToken, async (req, res) => {
 });
 app.get('/api/parts/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM hypercube_parts WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/parts', authenticateToken, async (req, res) => { try { const r = await pool.query(`INSERT INTO hypercube_parts (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, req.body.name, JSON.stringify(req.body.blocks), req.body.thumbnail]); res.status(201).json({ message: 'Zapisano.', id: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/parts/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'part_likes', 'part_id'); });
+app.post('/api/parts/:id/like', authenticateToken, async (req, res) => { handleLike(req, res, 'part_likes', 'part_id', 'hypercube_parts'); });
 app.get('/api/parts/:id/comments', authenticateToken, async (req, res) => { handleGetComments(req, res, 'part_comments', 'part_comment_likes', 'part_id'); });
 app.post('/api/parts/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'part_comments', 'part_id'); });
-app.post('/api/parts/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'part_comment_likes'); });
+app.post('/api/parts/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'part_comment_likes', 'part_comments'); });
 
 // --- USER & SOCIAL ---
 app.post('/api/register', async (req, res) => { const { username, password } = req.body; try { const hash = await bcrypt.hash(password, 10); await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0)`, [username, hash]); res.status(201).json({ message: 'Utworzono.' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/login', async (req, res) => { const { username, password } = req.body; try { const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]); const u = r.rows[0]; if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' }); const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' }); const nextLevelXp = getXpForNextLevel(u.level || 1); res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/user/me', authenticateToken, async (req, res) => { try { const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp FROM users WHERE id = $1', [req.user.userId]); if (r.rows.length === 0) return res.status(404).send(); const u = r.rows[0]; const nextLevelXp = getXpForNextLevel(u.level || 1); res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/user/me', authenticateToken, async (req, res) => { try { const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp, pending_xp FROM users WHERE id = $1', [req.user.userId]); if (r.rows.length === 0) return res.status(404).send(); const u = r.rows[0]; const nextLevelXp = getXpForNextLevel(u.level || 1); res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp, pendingXp: u.pending_xp || 0 }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/parkour/complete', authenticateToken, async (req, res) => { const userId = req.user.userId; const rewardCoins = 100; const rewardXp = 500; try { const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]); if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." }); let { coins, level, xp } = r.rows[0]; coins = (coins || 0) + rewardCoins; xp = (xp || 0) + rewardXp; level = level || 1; let levelUpOccurred = false; while (true) { const needed = getXpForNextLevel(level); if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; } } await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3 WHERE id = $4', [coins, level, xp, userId]); const nextLevelXp = getXpForNextLevel(level); res.json({ success: true, levelUp: levelUpOccurred, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` }); } catch (e) { res.status(500).json({ message: "Błąd serwera." }); } });
 app.post('/api/shop/buy', authenticateToken, async (req, res) => { const { blockName, cost } = req.body; const userId = req.user.userId; try { const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]); if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" }); const user = userResult.rows[0]; const currentCoins = user.coins || 0; let ownedBlocks = parseOwnedBlocks(user.owned_blocks); if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" }); if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" }); ownedBlocks.push(blockName); const newBalance = currentCoins - cost; await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]); res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks }); } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); } });
 app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -345,9 +406,9 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => { try { con
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const query = `SELECT DISTINCT ON (other_user_id) CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id, u.username AS other_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END) WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY other_user_id, m.created_at DESC`; const r = await pool.query(query, [userId]); const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); res.json(sorted); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const targetUsername = req.params.username; const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]); if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' }); const targetId = userRes.rows[0].id; const query = `SELECT m.sender_id, u.username AS sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) ORDER BY m.created_at ASC`; const r = await pool.query(query, [userId, targetId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// --- WS ---
+// WS
 function broadcastToWorld(worldId, data, excludeId = null) { 
-    // FIX: Wymuszenie stringa dla worldId przy porównaniu
+    // Wymuszenie stringa dla worldId przy porównaniu
     const worldStr = String(worldId);
     const msg = JSON.stringify(data); 
     players.forEach((p, id) => { 
@@ -418,19 +479,18 @@ wss.on('connection', (ws, req) => {
                 const p = players.get(playerId); 
                 if (!p) return; 
                 
-                // --- FIX: LEPSZA OBSŁUGA ZMIANY ŚWIATA ---
                 if (data.type === 'joinWorld') { 
                     const oldWorld = String(p.currentWorld); 
                     const newWorld = String(data.worldId || 'nexus'); 
                     
                     if (oldWorld !== newWorld) { 
-                        // 1. Poinformuj stary świat, że wyszedłeś
+                        // 1. Poinformuj stary świat
                         broadcastToWorld(oldWorld, { type: 'playerLeft', id: playerId }, playerId); 
                         
                         // 2. Zmień stan gracza
                         p.currentWorld = newWorld; 
                         
-                        // Reset pozycji (zależy czy Nexus czy Świat)
+                        // Reset pozycji
                         if (newWorld === 'nexus') { 
                             p.position = getSmartSpawnPosition(0.5, 0.5, true); 
                         } else { 
@@ -446,7 +506,7 @@ wss.on('connection', (ws, req) => {
                         }); 
                         ws.send(JSON.stringify({ type: 'playerList', players: roomPlayers })); 
                         
-                        // 4. Poinformuj nowy świat, że wszedłeś
+                        // 4. Poinformuj nowy świat
                         broadcastToWorld(newWorld, { type: 'playerJoined', id: playerId, nickname: username, skinData: p.skinData, position: p.position, quaternion: p.quaternion }, playerId); 
                         
                         // 5. Monety w Nexusie
@@ -494,17 +554,11 @@ wss.on('connection', (ws, req) => {
         });
         
         ws.on('close', () => { 
+            const p = players.get(playerId);
+            const worldId = p ? String(p.currentWorld) : 'nexus';
             players.delete(playerId); 
             notifyFriendsStatus(playerId, false); 
-            // Przy wyjściu, wyślij info do aktualnego świata
-            const p = { currentWorld: 'nexus' }; // Fallback
-            // Musimy pobrać world sprzed usunięcia, ale już usunęliśmy z mapy.
-            // Warto zapisać 'currentWorld' w domknięciu lub obiekcie p przed delete?
-            // Tutaj uprościłem - przy rozłączeniu serwer i tak iteruje mapę w broadcast, ale gracza już tam nie ma.
-            // Poprawne podejście:
-            // broadcastToWorld pobiera graczy z mapy. Usuniętego już tam nie ma.
-            // Więc musimy wysłać info do pozostałych.
-            // Wywołanie broadcastToWorld z worldId 'nexus' (lub zapamiętanym) zadziała dla INNYCH graczy.
+            broadcastToWorld(worldId, { type: 'playerLeft', id: playerId }); 
         });
     });
 });
