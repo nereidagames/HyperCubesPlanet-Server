@@ -12,7 +12,14 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
-app.use(cors({ origin: '*' })); 
+// Konfiguracja CORS - zezwól na wszystko i obsłuż preflight (OPTIONS)
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization']
+}));
+app.options('*', cors()); // Ważne dla preflight requests
+
 app.use(express.json({ limit: '50mb' })); 
 
 const server = http.createServer(app);
@@ -20,7 +27,7 @@ const wss = new WebSocketServer({ server });
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false } // Wymagane dla Neon/Render
 });
 
 const players = new Map();
@@ -38,10 +45,16 @@ function getXpForNextLevel(currentLevel) {
 
 let nexusBlocksCache = [];
 
+// --- DATABASE FUNCTIONS ---
+
 async function loadNexusMapToMemory() {
     try {
+        // Sprawdź czy tabela istnieje zanim zapytasz
         const tableCheck = await pool.query(`SELECT to_regclass('public.nexus_map');`);
-        if (!tableCheck.rows[0].to_regclass) return;
+        if (!tableCheck.rows[0].to_regclass) {
+            console.log("[Server] Tabela nexus_map jeszcze nie istnieje. Pomijam ładowanie.");
+            return;
+        }
 
         const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
         if (result.rows.length > 0) {
@@ -49,26 +62,88 @@ async function loadNexusMapToMemory() {
             console.log(`[Server] Załadowano mapę Nexusa: ${nexusBlocksCache.length} bloków.`);
         } else {
             nexusBlocksCache = [];
+            console.log("[Server] Mapa Nexusa jest pusta.");
         }
     } catch (e) {
-        console.error("[Server] Błąd cache mapy:", e.message);
+        console.error("[Server] Błąd cache mapy (niekrytyczny):", e.message);
         nexusBlocksCache = [];
     }
 }
 
-async function autoMigrate() {
-    console.log("[Server] Sprawdzanie struktury bazy danych...");
-    try {
-        // Users
-        await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS coins INTEGER DEFAULT 0 NOT NULL;`); } catch(e){}
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS current_skin_thumbnail TEXT;`); } catch(e){}
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS owned_blocks JSONB DEFAULT '["Ziemia"]'::jsonb;`); } catch(e){}
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS level INTEGER DEFAULT 1;`); } catch(e){}
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS xp INTEGER DEFAULT 0;`); } catch(e){}
-        try { await pool.query(`ALTER TABLE users ADD COLUMN IF NOT EXISTS pending_xp INTEGER DEFAULT 0;`); } catch(e){}
+function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
+    let highestBlock = null;
+    let highestY = -1000;
+    const searchRadius = 0.6; 
 
-        // Nexus
+    if (nexusBlocksCache.length === 0) {
+        return { x: targetX, y: 30.0, z: targetZ };
+    }
+
+    for (const block of nexusBlocksCache) {
+        if (Math.abs(targetX - block.x) < searchRadius && Math.abs(targetZ - block.z) < searchRadius) {
+            if (block.y > highestY) {
+                highestY = block.y;
+                highestBlock = block;
+            }
+        }
+    }
+
+    if (highestBlock) {
+        const offset = isPlayer ? 20.0 : 0.8; 
+        return {
+            x: highestBlock.x, 
+            y: highestY + 0.5 + offset, 
+            z: highestBlock.z 
+        };
+    } else {
+        return {
+            x: targetX,
+            y: isPlayer ? 30.0 : 1.0, 
+            z: targetZ
+        };
+    }
+}
+
+const authenticateToken = (req, res, next) => {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (token == null) return res.sendStatus(401);
+
+    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
+        if (err) return res.sendStatus(403);
+        req.user = user;
+        next();
+    });
+};
+
+// Pingowanie WebSocketów (Keep-Alive)
+const interval = setInterval(function ping() {
+  wss.clients.forEach(function each(ws) {
+    if (ws.isAlive === false) return ws.terminate();
+    ws.isAlive = false;
+    ws.ping();
+  });
+}, 30000);
+
+app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
+
+async function autoMigrate() {
+    console.log("[Server] Rozpoczynam migrację bazy danych...");
+    try {
+        await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        
+        // Dodawanie kolumn (bezpieczne)
+        const addCol = async (table, col, type) => {
+            try { await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type};`); } catch(e){}
+        };
+
+        await addCol('users', 'coins', 'INTEGER DEFAULT 0 NOT NULL');
+        await addCol('users', 'current_skin_thumbnail', 'TEXT');
+        await addCol('users', 'owned_blocks', `JSONB DEFAULT '["Ziemia"]'::jsonb`);
+        await addCol('users', 'level', 'INTEGER DEFAULT 1');
+        await addCol('users', 'xp', 'INTEGER DEFAULT 0');
+        await addCol('users', 'pending_xp', 'INTEGER DEFAULT 0');
+
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
         if (mapCheck.rowCount === 0) { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`); }
@@ -91,12 +166,12 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS part_comments (id SERIAL PRIMARY KEY, part_id INTEGER REFERENCES hypercube_parts(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES part_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
-        // Social & News
+        // Social
         await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
-        // FIX: Upewnienie się, że tabela user_news istnieje
+        // News (Nagrody)
         await pool.query(`
             CREATE TABLE IF NOT EXISTS user_news (
                 id SERIAL PRIMARY KEY,
@@ -113,7 +188,6 @@ async function autoMigrate() {
             );
         `);
 
-        await loadNexusMapToMemory();
         console.log("[Server] Baza danych gotowa.");
     } catch (e) {
         console.error("[Server] Błąd migracji:", e.message);
@@ -134,19 +208,7 @@ function parseOwnedBlocks(dbValue) {
     return ["Ziemia"];
 }
 
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-    if (token == null) return res.sendStatus(401);
-
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.sendStatus(403);
-        req.user = user;
-        next();
-    });
-};
-
-// --- REWARDS LOGIC ---
+// --- HELPERS (With Rewards) ---
 async function addNews(userId, type, sourceUserId, targetId, targetName, targetThumbnail, xp, coins) {
     try {
         await pool.query(`
@@ -164,10 +226,8 @@ async function handleLike(req, res, tableName, colName, parentTableName) {
     try {
         const check = await pool.query(`SELECT id FROM ${tableName} WHERE ${colName} = $1 AND user_id = $2`, [objId, userId]);
         if (check.rows.length > 0) {
-            // Unlike - remove like but keep news history (usually games don't remove reward notifications)
             await pool.query(`DELETE FROM ${tableName} WHERE ${colName} = $1 AND user_id = $2`, [objId, userId]);
         } else {
-            // Like
             await pool.query(`INSERT INTO ${tableName} (${colName}, user_id) VALUES ($1, $2)`, [objId, userId]);
             
             // Nagroda dla właściciela
@@ -235,7 +295,8 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
     } catch (e) { res.status(500).json({message: "DB Error"}); }
 }
 
-// --- API: NEWS & REWARDS ---
+// --- ENDPOINTS ---
+
 app.get('/api/news', authenticateToken, async (req, res) => {
     try {
         const r = await pool.query(`
@@ -246,14 +307,11 @@ app.get('/api/news', authenticateToken, async (req, res) => {
             ORDER BY n.created_at DESC
         `, [req.user.userId]);
         res.json(r.rows);
-    } catch(e) { 
-        console.error(e);
-        res.status(500).json({ message: "Błąd pobierania newsów" }); 
-    }
+    } catch(e) { res.status(500).json({ message: "Błąd news" }); }
 });
 
 app.post('/api/news/claim', authenticateToken, async (req, res) => {
-    const { newsId } = req.body; 
+    const { newsId } = req.body;
     const userId = req.user.userId;
     
     try {
@@ -305,13 +363,9 @@ app.post('/api/news/claim', authenticateToken, async (req, res) => {
             levelUp: levelUpOccurred
         });
 
-    } catch(e) { 
-        console.error(e);
-        res.status(500).json({ message: "Błąd serwera." }); 
-    }
+    } catch(e) { res.status(500).json({ message: "Błąd serwera." }); }
 });
 
-// --- API: USER ---
 app.get('/api/user/me', authenticateToken, async (req, res) => { 
     try { 
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp FROM users WHERE id = $1', [req.user.userId]); 
@@ -333,13 +387,13 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); } 
 });
 
-// --- REST OF ENDPOINTS ---
 app.get('/api/nexus', async (req, res) => {
     if (nexusBlocksCache && nexusBlocksCache.length > 0) return res.json(nexusBlocksCache);
     try { const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1'); if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data || []; return res.json(nexusBlocksCache); } res.json([]); } catch (e) { res.status(500).json({ message: e.message }); }
 });
 app.post('/api/nexus', authenticateToken, async (req, res) => { const { blocks } = req.body; try { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]); nexusBlocksCache = blocks; res.json({ message: 'Zapisano!' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 
+// Skins
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id WHERE s.owner_id = $1 ORDER BY s.created_at DESC`; const r = await pool.query(query, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -349,6 +403,7 @@ app.get('/api/skins/:id/comments', authenticateToken, async (req, res) => { hand
 app.post('/api/skins/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'skin_comments', 'skin_id'); });
 app.post('/api/skins/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'skin_comment_likes', 'skin_comments'); });
 
+// Prefabs
 app.get('/api/prefabs/all', authenticateToken, async (req, res) => { try { const query = `SELECT p.id, p.name, p.thumbnail, p.owner_id, p.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM prefab_likes pl WHERE pl.prefab_id = p.id) as likes, (SELECT COUNT(*) FROM prefab_comments pc WHERE pc.prefab_id = p.id) as comments FROM prefabs p JOIN users u ON p.owner_id = u.id ORDER BY p.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/prefabs/mine', authenticateToken, async (req, res) => { try { const query = `SELECT p.id, p.name, p.thumbnail, p.owner_id, p.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM prefab_likes pl WHERE pl.prefab_id = p.id) as likes, (SELECT COUNT(*) FROM prefab_comments pc WHERE pc.prefab_id = p.id) as comments FROM prefabs p JOIN users u ON p.owner_id = u.id WHERE p.owner_id = $1 ORDER BY p.created_at DESC`; const r = await pool.query(query, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/prefabs/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM prefabs WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -358,6 +413,7 @@ app.get('/api/prefabs/:id/comments', authenticateToken, async (req, res) => { ha
 app.post('/api/prefabs/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'prefab_comments', 'prefab_id'); });
 app.post('/api/prefabs/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'prefab_comment_likes', 'prefab_comments'); });
 
+// Parts
 app.get('/api/parts/all', authenticateToken, async (req, res) => { try { const query = `SELECT p.id, p.name, p.thumbnail, p.owner_id, p.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM part_likes pl WHERE pl.part_id = p.id) as likes, (SELECT COUNT(*) FROM part_comments pc WHERE pc.part_id = p.id) as comments FROM hypercube_parts p JOIN users u ON p.owner_id = u.id ORDER BY p.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/parts/mine', authenticateToken, async (req, res) => { try { const query = `SELECT p.id, p.name, p.thumbnail, p.owner_id, p.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM part_likes pl WHERE pl.part_id = p.id) as likes, (SELECT COUNT(*) FROM part_comments pc WHERE pc.part_id = p.id) as comments FROM hypercube_parts p JOIN users u ON p.owner_id = u.id WHERE p.owner_id = $1 ORDER BY p.created_at DESC`; const r = await pool.query(query, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/parts/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM hypercube_parts WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -367,6 +423,7 @@ app.get('/api/parts/:id/comments', authenticateToken, async (req, res) => { hand
 app.post('/api/parts/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'part_comments', 'part_id'); });
 app.post('/api/parts/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'part_comment_likes', 'part_comments'); });
 
+// Common
 app.post('/api/register', async (req, res) => { const { username, password } = req.body; try { const hash = await bcrypt.hash(password, 10); await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0)`, [username, hash]); res.status(201).json({ message: 'Utworzono.' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/login', async (req, res) => { const { username, password } = req.body; try { const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]); const u = r.rows[0]; if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' }); const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' }); const nextLevelXp = getXpForNextLevel(u.level || 1); res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/parkour/complete', authenticateToken, async (req, res) => { const userId = req.user.userId; const rewardCoins = 100; const rewardXp = 500; try { const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]); if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." }); let { coins, level, xp } = r.rows[0]; coins = (coins || 0) + rewardCoins; xp = (xp || 0) + rewardXp; level = level || 1; let levelUpOccurred = false; while (true) { const needed = getXpForNextLevel(level); if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; } } await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3 WHERE id = $4', [coins, level, xp, userId]); const nextLevelXp = getXpForNextLevel(level); res.json({ success: true, levelUp: levelUpOccurred, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` }); } catch (e) { res.status(500).json({ message: "Błąd serwera." }); } });
@@ -382,7 +439,7 @@ app.post('/api/coins/update', authenticateToken, async (req, res) => { try { con
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const query = `SELECT DISTINCT ON (other_user_id) CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id, u.username AS other_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END) WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY other_user_id, m.created_at DESC`; const r = await pool.query(query, [userId]); const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); res.json(sorted); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const targetUsername = req.params.username; const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]); if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' }); const targetId = userRes.rows[0].id; const query = `SELECT m.sender_id, u.username AS sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) ORDER BY m.created_at ASC`; const r = await pool.query(query, [userId, targetId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// WS
+// --- WS ---
 function broadcastToWorld(worldId, data, excludeId = null) { 
     const worldStr = String(worldId);
     const msg = JSON.stringify(data); 
@@ -419,4 +476,16 @@ wss.on('connection', (ws, req) => {
     });
 });
 
-server.listen(port, () => { console.log(`Serwer: ${port}`); autoMigrate(); loadNexusMapToMemory(); setTimeout(spawnCoin, 10000); const RENDER_URL = process.env.RENDER_EXTERNAL_URL; if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); });
+// START
+server.listen(port, async () => { 
+    console.log(`Serwer: ${port}`); 
+    try {
+        await autoMigrate(); 
+        await loadNexusMapToMemory();
+        setTimeout(spawnCoin, 10000); 
+    } catch (e) {
+        console.error("Critical Startup Error:", e);
+    }
+    const RENDER_URL = process.env.RENDER_EXTERNAL_URL; 
+    if (RENDER_URL) setInterval(() => { https.get(RENDER_URL).on('error', () => {}); }, 840000); 
+});
