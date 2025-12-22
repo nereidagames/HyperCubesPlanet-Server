@@ -12,12 +12,13 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
+// Konfiguracja CORS - zezwól na wszystko i obsłuż preflight (OPTIONS)
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
-app.options('*', cors());
+app.options('*', cors()); 
 
 app.use(express.json({ limit: '50mb' })); 
 
@@ -26,7 +27,7 @@ const wss = new WebSocketServer({ server });
 
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }
+  ssl: { rejectUnauthorized: false } 
 });
 
 const players = new Map();
@@ -49,7 +50,10 @@ let nexusBlocksCache = [];
 async function loadNexusMapToMemory() {
     try {
         const tableCheck = await pool.query(`SELECT to_regclass('public.nexus_map');`);
-        if (!tableCheck.rows[0].to_regclass) return;
+        if (!tableCheck.rows[0].to_regclass) {
+            console.log("[Server] Tabela nexus_map jeszcze nie istnieje. Pomijam ładowanie.");
+            return;
+        }
 
         const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
         if (result.rows.length > 0) {
@@ -57,9 +61,10 @@ async function loadNexusMapToMemory() {
             console.log(`[Server] Załadowano mapę Nexusa: ${nexusBlocksCache.length} bloków.`);
         } else {
             nexusBlocksCache = [];
+            console.log("[Server] Mapa Nexusa jest pusta.");
         }
     } catch (e) {
-        console.error("[Server] Błąd cache mapy:", e.message);
+        console.error("[Server] Błąd cache mapy (niekrytyczny):", e.message);
         nexusBlocksCache = [];
     }
 }
@@ -84,9 +89,17 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
 
     if (highestBlock) {
         const offset = isPlayer ? 20.0 : 0.8; 
-        return { x: highestBlock.x, y: highestY + 0.5 + offset, z: highestBlock.z };
+        return {
+            x: highestBlock.x, 
+            y: highestY + 0.5 + offset, 
+            z: highestBlock.z 
+        };
     } else {
-        return { x: targetX, y: isPlayer ? 30.0 : 1.0, z: targetZ };
+        return {
+            x: targetX,
+            y: isPlayer ? 30.0 : 1.0, 
+            z: targetZ
+        };
     }
 }
 
@@ -156,7 +169,21 @@ async function autoMigrate() {
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
-        await pool.query(`CREATE TABLE IF NOT EXISTS user_news (id SERIAL PRIMARY KEY, user_id INTEGER REFERENCES users(id) NOT NULL, type VARCHAR(50) NOT NULL, source_user_id INTEGER REFERENCES users(id), target_id INTEGER, target_name VARCHAR(100), target_thumbnail TEXT, reward_xp INTEGER DEFAULT 0, reward_coins INTEGER DEFAULT 0, is_claimed BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS user_news (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER REFERENCES users(id) NOT NULL,
+                type VARCHAR(50) NOT NULL,
+                source_user_id INTEGER REFERENCES users(id),
+                target_id INTEGER,
+                target_name VARCHAR(100),
+                target_thumbnail TEXT,
+                reward_xp INTEGER DEFAULT 0,
+                reward_coins INTEGER DEFAULT 0,
+                is_claimed BOOLEAN DEFAULT false,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
 
         await loadNexusMapToMemory();
         console.log("[Server] Baza danych gotowa.");
@@ -179,11 +206,16 @@ function parseOwnedBlocks(dbValue) {
     return ["Ziemia"];
 }
 
-// HELPERS (With Rewards)
+// HELPERS
 async function addNews(userId, type, sourceUserId, targetId, targetName, targetThumbnail, xp, coins) {
     try {
-        await pool.query(`INSERT INTO user_news (user_id, type, source_user_id, target_id, target_name, target_thumbnail, reward_xp, reward_coins) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`, [userId, type, sourceUserId, targetId, targetName, targetThumbnail, xp, coins]);
-    } catch (e) { console.error("Błąd dodawania newsa:", e); }
+        await pool.query(`
+            INSERT INTO user_news (user_id, type, source_user_id, target_id, target_name, target_thumbnail, reward_xp, reward_coins)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+        `, [userId, type, sourceUserId, targetId, targetName, targetThumbnail, xp, coins]);
+    } catch (e) {
+        console.error("Błąd dodawania newsa:", e);
+    }
 }
 
 async function handleLike(req, res, tableName, colName, parentTableName) {
@@ -205,13 +237,25 @@ async function handleLike(req, res, tableName, colName, parentTableName) {
         }
         const count = await pool.query(`SELECT COUNT(*) FROM ${tableName} WHERE ${colName} = $1`, [objId]);
         res.json({ success: true, likes: count.rows[0].count });
-    } catch (e) { console.error(e); res.status(500).json({ message: "DB Error" }); }
+    } catch (e) { 
+        console.error(e);
+        res.status(500).json({ message: "DB Error" }); 
+    }
 }
 
 async function handleGetComments(req, res, tableName, likesTable, colName) {
     const objId = req.params.id;
     try {
-        const query = `SELECT c.id, c.text, c.created_at, u.username, u.current_skin_thumbnail, (SELECT COUNT(*) FROM ${likesTable} l WHERE l.comment_id = c.id) as likes FROM ${tableName} c JOIN users u ON c.user_id = u.id WHERE c.${colName} = $1 ORDER BY c.created_at DESC`;
+        const query = `
+            SELECT 
+                c.id, c.text, c.created_at, 
+                u.username, u.current_skin_thumbnail,
+                (SELECT COUNT(*) FROM ${likesTable} l WHERE l.comment_id = c.id) as likes
+            FROM ${tableName} c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.${colName} = $1
+            ORDER BY c.created_at DESC
+        `;
         const r = await pool.query(query, [objId]);
         res.json(r.rows);
     } catch (e) { res.status(500).json({ message: "DB Error" }); }
@@ -249,33 +293,46 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
     } catch (e) { res.status(500).json({message: "DB Error"}); }
 }
 
-// --- NEW ENDPOINT: WALL DATA ---
+// --- NEW ENDPOINT: WALL DATA (FIXED WITH JOIN) ---
 app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     const targetUserId = req.params.id;
     try {
-        // Równoległe pobieranie danych
+        // FIX: Dodano JOIN do users, aby pobrać dane twórcy (username, level, skin)
         const [skins, worlds, prefabs, parts] = await Promise.all([
             pool.query(`
-                SELECT id, name, thumbnail, created_at,
-                (SELECT COUNT(*) FROM skin_likes WHERE skin_id = skins.id) as likes,
-                (SELECT COUNT(*) FROM skin_comments WHERE skin_id = skins.id) as comments
-                FROM skins WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 20`, [targetUserId]),
+                SELECT s.id, s.name, s.thumbnail, s.created_at, s.owner_id,
+                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
+                       (SELECT COUNT(*) FROM skin_likes WHERE skin_id = s.id) as likes,
+                       (SELECT COUNT(*) FROM skin_comments WHERE skin_id = s.id) as comments
+                FROM skins s
+                JOIN users u ON s.owner_id = u.id
+                WHERE s.owner_id = $1 ORDER BY s.created_at DESC LIMIT 20`, [targetUserId]),
             
             pool.query(`
-                SELECT id, name, thumbnail, created_at, 0 as likes, 0 as comments
-                FROM worlds WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 20`, [targetUserId]),
+                SELECT w.id, w.name, w.thumbnail, w.created_at, w.owner_id,
+                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
+                       0 as likes, 0 as comments
+                FROM worlds w
+                JOIN users u ON w.owner_id = u.id
+                WHERE w.owner_id = $1 ORDER BY w.created_at DESC LIMIT 20`, [targetUserId]),
             
             pool.query(`
-                SELECT id, name, thumbnail, created_at,
-                (SELECT COUNT(*) FROM prefab_likes WHERE prefab_id = prefabs.id) as likes,
-                (SELECT COUNT(*) FROM prefab_comments WHERE prefab_id = prefabs.id) as comments
-                FROM prefabs WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 20`, [targetUserId]),
+                SELECT p.id, p.name, p.thumbnail, p.created_at, p.owner_id,
+                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
+                       (SELECT COUNT(*) FROM prefab_likes WHERE prefab_id = p.id) as likes,
+                       (SELECT COUNT(*) FROM prefab_comments WHERE prefab_id = p.id) as comments
+                FROM prefabs p
+                JOIN users u ON p.owner_id = u.id
+                WHERE p.owner_id = $1 ORDER BY p.created_at DESC LIMIT 20`, [targetUserId]),
             
             pool.query(`
-                SELECT id, name, thumbnail, created_at,
-                (SELECT COUNT(*) FROM part_likes WHERE part_id = hypercube_parts.id) as likes,
-                (SELECT COUNT(*) FROM part_comments WHERE part_id = hypercube_parts.id) as comments
-                FROM hypercube_parts WHERE owner_id = $1 ORDER BY created_at DESC LIMIT 20`, [targetUserId])
+                SELECT h.id, h.name, h.thumbnail, h.created_at, h.owner_id,
+                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
+                       (SELECT COUNT(*) FROM part_likes WHERE part_id = h.id) as likes,
+                       (SELECT COUNT(*) FROM part_comments WHERE part_id = h.id) as comments
+                FROM hypercube_parts h
+                JOIN users u ON h.owner_id = u.id
+                WHERE h.owner_id = $1 ORDER BY h.created_at DESC LIMIT 20`, [targetUserId])
         ]);
 
         res.json({
@@ -291,16 +348,23 @@ app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     }
 });
 
-// --- API: NEWS & REWARDS ---
+
+// --- API ENDPOINTS (Common) ---
 app.get('/api/news', authenticateToken, async (req, res) => {
     try {
-        const r = await pool.query(`SELECT n.*, u.username as source_username, u.current_skin_thumbnail as source_user_skin FROM user_news n LEFT JOIN users u ON n.source_user_id = u.id WHERE n.user_id = $1 AND n.is_claimed = false ORDER BY n.created_at DESC`, [req.user.userId]);
+        const r = await pool.query(`
+            SELECT n.*, u.username as source_username, u.current_skin_thumbnail as source_user_skin
+            FROM user_news n
+            LEFT JOIN users u ON n.source_user_id = u.id
+            WHERE n.user_id = $1 AND n.is_claimed = false
+            ORDER BY n.created_at DESC
+        `, [req.user.userId]);
         res.json(r.rows);
     } catch(e) { res.status(500).json({ message: "Błąd pobierania newsów" }); }
 });
 
 app.post('/api/news/claim', authenticateToken, async (req, res) => {
-    const { newsId } = req.body; 
+    const { newsId } = req.body;
     const userId = req.user.userId;
     try {
         let newsItems = [];
@@ -311,14 +375,19 @@ app.post('/api/news/claim', authenticateToken, async (req, res) => {
             const r = await pool.query(`SELECT * FROM user_news WHERE user_id = $1 AND is_claimed = false`, [userId]);
             newsItems = r.rows;
         }
+
         if (newsItems.length === 0) return res.json({ success: false, message: "Brak nagród." });
 
         let totalXp = 0;
         let totalCoins = 0;
+
         const ids = newsItems.map(n => n.id);
         await pool.query(`UPDATE user_news SET is_claimed = true WHERE id = ANY($1)`, [ids]);
 
-        newsItems.forEach(n => { totalXp += (n.reward_xp || 0); totalCoins += (n.reward_coins || 0); });
+        newsItems.forEach(n => {
+            totalXp += (n.reward_xp || 0);
+            totalCoins += (n.reward_coins || 0);
+        });
 
         const userRes = await pool.query('SELECT coins, level, xp, total_xp FROM users WHERE id = $1', [userId]);
         let { coins, level, xp, total_xp } = userRes.rows[0];
@@ -332,22 +401,43 @@ app.post('/api/news/claim', authenticateToken, async (req, res) => {
             const needed = getXpForNextLevel(level);
             if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; }
         }
+
         await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3, pending_xp = 0, total_xp = $4 WHERE id = $5', [coins, level, xp, total_xp, userId]);
         const nextLevelXp = getXpForNextLevel(level);
-        res.json({ success: true, totalXp, totalCoins, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, levelUp: levelUpOccurred });
+
+        res.json({
+            success: true,
+            totalXp,
+            totalCoins,
+            newCoins: coins,
+            newLevel: level,
+            newXp: xp,
+            maxXp: nextLevelXp,
+            levelUp: levelUpOccurred
+        });
+
     } catch(e) { res.status(500).json({ message: "Błąd serwera." }); }
 });
 
-// --- API: USER ---
 app.get('/api/user/me', authenticateToken, async (req, res) => { 
     try { 
         const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp, pending_xp, created_at FROM users WHERE id = $1', [req.user.userId]); 
         if (r.rows.length === 0) return res.status(404).send(); 
         const u = r.rows[0]; 
         const nextLevelXp = getXpForNextLevel(u.level || 1); 
+        
         const newsCountRes = await pool.query('SELECT COUNT(*) FROM user_news WHERE user_id = $1 AND is_claimed = false', [u.id]);
         const newsCount = parseInt(newsCountRes.rows[0].count);
-        res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp, pendingXp: newsCount, created_at: u.created_at }, thumbnail: u.current_skin_thumbnail }); 
+
+        res.json({ 
+            user: { 
+                id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), 
+                level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp,
+                pendingXp: newsCount,
+                created_at: u.created_at
+            }, 
+            thumbnail: u.current_skin_thumbnail 
+        }); 
     } catch (e) { res.status(500).json({ message: e.message }); } 
 });
 
@@ -371,7 +461,6 @@ app.get('/api/highscores/friends', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// Reszta endpointów bez zmian (Nexus, Skins, Prefabs, Parts, Social, Auth)...
 app.get('/api/nexus', async (req, res) => { if (nexusBlocksCache && nexusBlocksCache.length > 0) return res.json(nexusBlocksCache); try { const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1'); if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data || []; return res.json(nexusBlocksCache); } res.json([]); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/nexus', authenticateToken, async (req, res) => { const { blocks } = req.body; try { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]); nexusBlocksCache = blocks; res.json({ message: 'Zapisano!' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
