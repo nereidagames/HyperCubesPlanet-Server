@@ -1,3 +1,5 @@
+/* PLIK: server.js */
+
 require('dotenv').config();
 
 const express = require('express');
@@ -12,7 +14,7 @@ const https = require('https');
 const port = process.env.PORT || 10000;
 const app = express();
 
-// Konfiguracja CORS - zezwól na wszystko i obsłuż preflight (OPTIONS)
+// Konfiguracja CORS
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
@@ -297,42 +299,11 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
 app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     const targetUserId = req.params.id;
     try {
-        // FIX: Dodano JOIN do users, aby pobrać dane twórcy (username, level, skin)
         const [skins, worlds, prefabs, parts] = await Promise.all([
-            pool.query(`
-                SELECT s.id, s.name, s.thumbnail, s.created_at, s.owner_id,
-                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
-                       (SELECT COUNT(*) FROM skin_likes WHERE skin_id = s.id) as likes,
-                       (SELECT COUNT(*) FROM skin_comments WHERE skin_id = s.id) as comments
-                FROM skins s
-                JOIN users u ON s.owner_id = u.id
-                WHERE s.owner_id = $1 ORDER BY s.created_at DESC LIMIT 20`, [targetUserId]),
-            
-            pool.query(`
-                SELECT w.id, w.name, w.thumbnail, w.created_at, w.owner_id,
-                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
-                       0 as likes, 0 as comments
-                FROM worlds w
-                JOIN users u ON w.owner_id = u.id
-                WHERE w.owner_id = $1 ORDER BY w.created_at DESC LIMIT 20`, [targetUserId]),
-            
-            pool.query(`
-                SELECT p.id, p.name, p.thumbnail, p.created_at, p.owner_id,
-                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
-                       (SELECT COUNT(*) FROM prefab_likes WHERE prefab_id = p.id) as likes,
-                       (SELECT COUNT(*) FROM prefab_comments WHERE prefab_id = p.id) as comments
-                FROM prefabs p
-                JOIN users u ON p.owner_id = u.id
-                WHERE p.owner_id = $1 ORDER BY p.created_at DESC LIMIT 20`, [targetUserId]),
-            
-            pool.query(`
-                SELECT h.id, h.name, h.thumbnail, h.created_at, h.owner_id,
-                       u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail",
-                       (SELECT COUNT(*) FROM part_likes WHERE part_id = h.id) as likes,
-                       (SELECT COUNT(*) FROM part_comments WHERE part_id = h.id) as comments
-                FROM hypercube_parts h
-                JOIN users u ON h.owner_id = u.id
-                WHERE h.owner_id = $1 ORDER BY h.created_at DESC LIMIT 20`, [targetUserId])
+            pool.query(`SELECT s.id, s.name, s.thumbnail, s.created_at, s.owner_id, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes WHERE skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments WHERE skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id WHERE s.owner_id = $1 ORDER BY s.created_at DESC LIMIT 20`, [targetUserId]),
+            pool.query(`SELECT w.id, w.name, w.thumbnail, w.created_at, w.owner_id, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", 0 as likes, 0 as comments FROM worlds w JOIN users u ON w.owner_id = u.id WHERE w.owner_id = $1 ORDER BY w.created_at DESC LIMIT 20`, [targetUserId]),
+            pool.query(`SELECT p.id, p.name, p.thumbnail, p.created_at, p.owner_id, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM prefab_likes WHERE prefab_id = p.id) as likes, (SELECT COUNT(*) FROM prefab_comments WHERE prefab_id = p.id) as comments FROM prefabs p JOIN users u ON p.owner_id = u.id WHERE p.owner_id = $1 ORDER BY p.created_at DESC LIMIT 20`, [targetUserId]),
+            pool.query(`SELECT h.id, h.name, h.thumbnail, h.created_at, h.owner_id, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM part_likes WHERE part_id = h.id) as likes, (SELECT COUNT(*) FROM part_comments WHERE part_id = h.id) as comments FROM hypercube_parts h JOIN users u ON h.owner_id = u.id WHERE h.owner_id = $1 ORDER BY h.created_at DESC LIMIT 20`, [targetUserId])
         ]);
 
         res.json({
@@ -345,6 +316,59 @@ app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     } catch (e) {
         console.error(e);
         res.status(500).json({ message: "Błąd pobierania ściany" });
+    }
+});
+
+// --- NOWY ENDPOINT: POBIERANIE PROFILU PUBLICZNEGO ---
+app.get('/api/user/profile/:username', authenticateToken, async (req, res) => {
+    try {
+        const { username } = req.params;
+        const r = await pool.query(
+            'SELECT id, username, level, created_at, current_skin_thumbnail FROM users WHERE username = $1',
+            [username]
+        );
+
+        if (r.rows.length === 0) {
+            return res.status(404).json({ message: "Gracz nie znaleziony" });
+        }
+
+        res.json(r.rows[0]);
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: "Błąd serwera" });
+    }
+});
+
+// --- NOWY ENDPOINT: USUWANIE ZNAJOMEGO ---
+app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
+    const targetId = parseInt(req.params.id);
+    const myId = req.user.userId;
+
+    try {
+        const r = await pool.query(
+            `DELETE FROM friendships
+             WHERE (user_id1 = $1 AND user_id2 = $2)
+                OR (user_id1 = $2 AND user_id2 = $1)`,
+            [myId, targetId]
+        );
+
+        if (r.rowCount === 0) {
+            return res.status(404).json({ message: "Nie jesteście znajomymi." });
+        }
+
+        res.json({ success: true, message: "Usunięto ze znajomych." });
+
+        // Powiadomienie przez WebSocket o zmianie statusu
+        [myId, targetId].forEach(pid => {
+            const p = players.get(pid);
+            if (p && p.ws.readyState === 1) {
+                p.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
+            }
+        });
+
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: "Błąd serwera" });
     }
 });
 
