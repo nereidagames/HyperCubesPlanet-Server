@@ -138,6 +138,7 @@ async function autoMigrate() {
 
         await addCol('users', 'coins', 'INTEGER DEFAULT 0 NOT NULL');
         await addCol('users', 'current_skin_thumbnail', 'TEXT');
+        await addCol('users', 'current_skin_id', 'INTEGER'); // ID aktywnego skina
         await addCol('users', 'owned_blocks', `JSONB DEFAULT '["Ziemia"]'::jsonb`);
         await addCol('users', 'level', 'INTEGER DEFAULT 1');
         await addCol('users', 'xp', 'INTEGER DEFAULT 0');
@@ -295,7 +296,7 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
     } catch (e) { res.status(500).json({message: "DB Error"}); }
 }
 
-// --- NEW ENDPOINT: WALL DATA (FIXED WITH JOIN) ---
+// --- WALL DATA ---
 app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     const targetUserId = req.params.id;
     try {
@@ -319,7 +320,7 @@ app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     }
 });
 
-// --- NOWY ENDPOINT: POBIERANIE PROFILU PUBLICZNEGO ---
+// --- POBIERANIE PROFILU PUBLICZNEGO ---
 app.get('/api/user/profile/:username', authenticateToken, async (req, res) => {
     try {
         const { username } = req.params;
@@ -339,7 +340,7 @@ app.get('/api/user/profile/:username', authenticateToken, async (req, res) => {
     }
 });
 
-// --- NOWY ENDPOINT: USUWANIE ZNAJOMEGO ---
+// --- USUWANIE ZNAJOMEGO ---
 app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
     const targetId = parseInt(req.params.id);
     const myId = req.user.userId;
@@ -372,119 +373,116 @@ app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
     }
 });
 
+// --- ZAKŁADANIE KONTA + STARTOWY SKIN ---
+app.post('/api/register', async (req, res) => {
+    const { username, password, starterSkin } = req.body;
+    
+    try {
+        const hash = await bcrypt.hash(password, 10);
+        
+        // 1. Stwórz użytkownika
+        const userRes = await pool.query(
+            `INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp, total_xp) 
+             VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0, 0) RETURNING id`, 
+            [username, hash]
+        );
+        const userId = userRes.rows[0].id;
 
-// --- API ENDPOINTS (Common) ---
+        // 2. Jeśli wybrano skin startowy, zapisz go w bazie
+        if (starterSkin) {
+            const thumb = "icons/avatar_placeholder.png"; // Placeholder, klient wygeneruje lepszy później
+            const blocks = JSON.stringify(starterSkin.blocks);
+            const skinName = starterSkin.name || "Mój pierwszy skin";
+
+            const skinRes = await pool.query(
+                `INSERT INTO skins (owner_id, name, blocks_data, thumbnail) 
+                 VALUES ($1, $2, $3, $4) RETURNING id`,
+                [userId, skinName, blocks, thumb]
+            );
+            const skinId = skinRes.rows[0].id;
+
+            // 3. Ustaw jako aktywny
+            await pool.query(
+                `UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`,
+                [skinId, thumb, userId]
+            );
+        }
+
+        res.status(201).json({ message: 'Utworzono.' });
+    } catch (e) {
+        console.error(e);
+        res.status(500).json({ message: e.message });
+    }
+});
+
+// --- LOGOWANIE + ZWRACANIE ID SKINA ---
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    try {
+        const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const u = r.rows[0];
+        
+        if (!u || !(await bcrypt.compare(password, u.password_hash))) {
+            return res.status(401).json({ message: 'Błąd logowania.' });
+        }
+        
+        const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
+        const nextLevelXp = getXpForNextLevel(u.level || 1);
+        
+        res.json({ 
+            token, 
+            user: { 
+                id: u.id, 
+                username: u.username, 
+                coins: u.coins || 0, 
+                ownedBlocks: parseOwnedBlocks(u.owned_blocks), 
+                level: u.level || 1, 
+                xp: u.xp || 0, 
+                maxXp: nextLevelXp,
+                // WAŻNE: Zwracamy ID aktywnego skina
+                currentSkinId: u.current_skin_id 
+            }, 
+            thumbnail: u.current_skin_thumbnail 
+        });
+    } catch (e) {
+        res.status(500).json({ message: e.message });
+    }
+});
+
+// --- WYPOSAŻANIE SKINA (EQUIP) ---
+app.post('/api/user/equip', authenticateToken, async (req, res) => {
+    const { skinId, thumbnail } = req.body;
+    const userId = req.user.userId;
+
+    try {
+        // Sprawdź czy user jest właścicielem (dla bezpieczeństwa)
+        const check = await pool.query('SELECT id FROM skins WHERE id = $1 AND owner_id = $2', [skinId, userId]);
+        if (check.rows.length === 0) {
+            return res.status(403).json({ message: "Nie posiadasz tego skina." });
+        }
+
+        await pool.query(
+            `UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`,
+            [skinId, thumbnail, userId]
+        );
+        res.json({ success: true });
+    } catch (e) {
+        res.status(500).json({ message: "Błąd bazy." });
+    }
+});
+
+
+// --- POZOSTAŁE ENDPOINTY (BEZ ZMIAN) ---
 app.get('/api/news', authenticateToken, async (req, res) => {
     try {
-        const r = await pool.query(`
-            SELECT n.*, u.username as source_username, u.current_skin_thumbnail as source_user_skin
-            FROM user_news n
-            LEFT JOIN users u ON n.source_user_id = u.id
-            WHERE n.user_id = $1 AND n.is_claimed = false
-            ORDER BY n.created_at DESC
-        `, [req.user.userId]);
+        const r = await pool.query(`SELECT n.*, u.username as source_username, u.current_skin_thumbnail as source_user_skin FROM user_news n LEFT JOIN users u ON n.source_user_id = u.id WHERE n.user_id = $1 AND n.is_claimed = false ORDER BY n.created_at DESC`, [req.user.userId]);
         res.json(r.rows);
     } catch(e) { res.status(500).json({ message: "Błąd pobierania newsów" }); }
 });
-
-app.post('/api/news/claim', authenticateToken, async (req, res) => {
-    const { newsId } = req.body;
-    const userId = req.user.userId;
-    try {
-        let newsItems = [];
-        if (newsId) {
-            const r = await pool.query(`SELECT * FROM user_news WHERE id = $1 AND user_id = $2 AND is_claimed = false`, [newsId, userId]);
-            newsItems = r.rows;
-        } else {
-            const r = await pool.query(`SELECT * FROM user_news WHERE user_id = $1 AND is_claimed = false`, [userId]);
-            newsItems = r.rows;
-        }
-
-        if (newsItems.length === 0) return res.json({ success: false, message: "Brak nagród." });
-
-        let totalXp = 0;
-        let totalCoins = 0;
-
-        const ids = newsItems.map(n => n.id);
-        await pool.query(`UPDATE user_news SET is_claimed = true WHERE id = ANY($1)`, [ids]);
-
-        newsItems.forEach(n => {
-            totalXp += (n.reward_xp || 0);
-            totalCoins += (n.reward_coins || 0);
-        });
-
-        const userRes = await pool.query('SELECT coins, level, xp, total_xp FROM users WHERE id = $1', [userId]);
-        let { coins, level, xp, total_xp } = userRes.rows[0];
-        
-        coins = (coins || 0) + totalCoins;
-        xp = (xp || 0) + totalXp;
-        total_xp = (total_xp || 0) + totalXp;
-
-        let levelUpOccurred = false;
-        while (true) {
-            const needed = getXpForNextLevel(level);
-            if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; }
-        }
-
-        await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3, pending_xp = 0, total_xp = $4 WHERE id = $5', [coins, level, xp, total_xp, userId]);
-        const nextLevelXp = getXpForNextLevel(level);
-
-        res.json({
-            success: true,
-            totalXp,
-            totalCoins,
-            newCoins: coins,
-            newLevel: level,
-            newXp: xp,
-            maxXp: nextLevelXp,
-            levelUp: levelUpOccurred
-        });
-
-    } catch(e) { res.status(500).json({ message: "Błąd serwera." }); }
-});
-
-app.get('/api/user/me', authenticateToken, async (req, res) => { 
-    try { 
-        const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, owned_blocks, level, xp, pending_xp, created_at FROM users WHERE id = $1', [req.user.userId]); 
-        if (r.rows.length === 0) return res.status(404).send(); 
-        const u = r.rows[0]; 
-        const nextLevelXp = getXpForNextLevel(u.level || 1); 
-        
-        const newsCountRes = await pool.query('SELECT COUNT(*) FROM user_news WHERE user_id = $1 AND is_claimed = false', [u.id]);
-        const newsCount = parseInt(newsCountRes.rows[0].count);
-
-        res.json({ 
-            user: { 
-                id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), 
-                level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp,
-                pendingXp: newsCount,
-                created_at: u.created_at
-            }, 
-            thumbnail: u.current_skin_thumbnail 
-        }); 
-    } catch (e) { res.status(500).json({ message: e.message }); } 
-});
-
-app.get('/api/highscores/global', async (req, res) => {
-    try {
-        const limit = 50;
-        const page = parseInt(req.query.page) || 1;
-        const offset = (page - 1) * limit;
-        const query = `SELECT id, username, total_xp, level, current_skin_thumbnail FROM users ORDER BY total_xp DESC LIMIT $1 OFFSET $2`;
-        const result = await pool.query(query, [limit, offset]);
-        res.json(result.rows);
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.get('/api/highscores/friends', authenticateToken, async (req, res) => {
-    const userId = req.user.userId;
-    try {
-        const query = `SELECT u.id, u.username, u.total_xp, u.level, u.current_skin_thumbnail FROM users u LEFT JOIN friendships f ON (u.id = f.user_id1 OR u.id = f.user_id2) WHERE u.id = $1 OR ((f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted') GROUP BY u.id ORDER BY u.total_xp DESC LIMIT 50`;
-        const result = await pool.query(query, [userId]);
-        res.json(result.rows);
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
+app.post('/api/news/claim', authenticateToken, async (req, res) => { /* ... (stary kod claim) ... */ const { newsId } = req.body; const userId = req.user.userId; try { let newsItems = []; if (newsId) { const r = await pool.query(`SELECT * FROM user_news WHERE id = $1 AND user_id = $2 AND is_claimed = false`, [newsId, userId]); newsItems = r.rows; } else { const r = await pool.query(`SELECT * FROM user_news WHERE user_id = $1 AND is_claimed = false`, [userId]); newsItems = r.rows; } if (newsItems.length === 0) return res.json({ success: false, message: "Brak nagród." }); let totalXp = 0; let totalCoins = 0; const ids = newsItems.map(n => n.id); await pool.query(`UPDATE user_news SET is_claimed = true WHERE id = ANY($1)`, [ids]); newsItems.forEach(n => { totalXp += (n.reward_xp || 0); totalCoins += (n.reward_coins || 0); }); const userRes = await pool.query('SELECT coins, level, xp, total_xp FROM users WHERE id = $1', [userId]); let { coins, level, xp, total_xp } = userRes.rows[0]; coins = (coins || 0) + totalCoins; xp = (xp || 0) + totalXp; total_xp = (total_xp || 0) + totalXp; let levelUpOccurred = false; while (true) { const needed = getXpForNextLevel(level); if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; } } await pool.query('UPDATE users SET coins = $1, level = $2, xp = $3, pending_xp = 0, total_xp = $4 WHERE id = $5', [coins, level, xp, total_xp, userId]); const nextLevelXp = getXpForNextLevel(level); res.json({ success: true, totalXp, totalCoins, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, levelUp: levelUpOccurred }); } catch(e) { res.status(500).json({ message: "Błąd serwera." }); } });
+app.get('/api/user/me', authenticateToken, async (req, res) => { try { const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, current_skin_id, owned_blocks, level, xp, pending_xp, created_at FROM users WHERE id = $1', [req.user.userId]); if (r.rows.length === 0) return res.status(404).send(); const u = r.rows[0]; const nextLevelXp = getXpForNextLevel(u.level || 1); const newsCountRes = await pool.query('SELECT COUNT(*) FROM user_news WHERE user_id = $1 AND is_claimed = false', [u.id]); const newsCount = parseInt(newsCountRes.rows[0].count); res.json({ user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp, pendingXp: newsCount, created_at: u.created_at, currentSkinId: u.current_skin_id }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/highscores/global', async (req, res) => { try { const limit = 50; const page = parseInt(req.query.page) || 1; const offset = (page - 1) * limit; const query = `SELECT id, username, total_xp, level, current_skin_thumbnail FROM users ORDER BY total_xp DESC LIMIT $1 OFFSET $2`; const result = await pool.query(query, [limit, offset]); res.json(result.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/highscores/friends', authenticateToken, async (req, res) => { const userId = req.user.userId; try { const query = `SELECT u.id, u.username, u.total_xp, u.level, u.current_skin_thumbnail FROM users u LEFT JOIN friendships f ON (u.id = f.user_id1 OR u.id = f.user_id2) WHERE u.id = $1 OR ((f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted') GROUP BY u.id ORDER BY u.total_xp DESC LIMIT 50`; const result = await pool.query(query, [userId]); res.json(result.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/nexus', async (req, res) => { if (nexusBlocksCache && nexusBlocksCache.length > 0) return res.json(nexusBlocksCache); try { const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1'); if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data || []; return res.json(nexusBlocksCache); } res.json([]); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/nexus', authenticateToken, async (req, res) => { const { blocks } = req.body; try { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]); nexusBlocksCache = blocks; res.json({ message: 'Zapisano!' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -511,20 +509,18 @@ app.post('/api/parts/:id/like', authenticateToken, async (req, res) => { handleL
 app.get('/api/parts/:id/comments', authenticateToken, async (req, res) => { handleGetComments(req, res, 'part_comments', 'part_comment_likes', 'part_id'); });
 app.post('/api/parts/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'part_comments', 'part_id'); });
 app.post('/api/parts/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'part_comment_likes', 'part_comments'); });
-app.post('/api/register', async (req, res) => { const { username, password } = req.body; try { const hash = await bcrypt.hash(password, 10); await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp, total_xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0, 0)`, [username, hash]); res.status(201).json({ message: 'Utworzono.' }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/login', async (req, res) => { const { username, password } = req.body; try { const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]); const u = r.rows[0]; if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' }); const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' }); const nextLevelXp = getXpForNextLevel(u.level || 1); res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp }, thumbnail: u.current_skin_thumbnail }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.post('/api/parkour/complete', authenticateToken, async (req, res) => { const userId = req.user.userId; const rewardCoins = 100; const rewardXp = 500; try { const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]); if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." }); let { coins, level, xp } = r.rows[0]; coins = (coins || 0) + rewardCoins; xp = (xp || 0) + rewardXp; level = level || 1; let levelUpOccurred = false; while (true) { const needed = getXpForNextLevel(level); if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; } } await pool.query(`UPDATE users SET coins = $1, level = $2, xp = $3, total_xp = COALESCE(total_xp, 0) + $5 WHERE id = $4`, [coins, level, xp, userId, rewardXp]); const nextLevelXp = getXpForNextLevel(level); res.json({ success: true, levelUp: levelUpOccurred, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` }); } catch (e) { res.status(500).json({ message: "Błąd serwera." }); } });
-app.post('/api/shop/buy', authenticateToken, async (req, res) => { const { blockName, cost } = req.body; const userId = req.user.userId; try { const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]); if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" }); const user = userResult.rows[0]; const currentCoins = user.coins || 0; let ownedBlocks = parseOwnedBlocks(user.owned_blocks); if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" }); if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" }); ownedBlocks.push(blockName); const newBalance = currentCoins - cost; await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]); res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks }); } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); } });
-app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator, w.world_data->>'type' as type FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
-app.get('/api/friends', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT u.id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = (CASE WHEN f.user_id1 = $1 THEN f.user_id2 ELSE f.user_id1 END) WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`, [req.user.userId]); const reqs = await pool.query(`SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [req.user.userId]); const friends = r.rows.map(f => ({ ...f, isOnline: players.has(f.id) })); res.json({ friends, requests: reqs.rows }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/search', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, username, current_skin_thumbnail FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10`, [`%${req.body.query}%`, req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/request', authenticateToken, async (req, res) => { const { targetUserId } = req.body; if(req.user.userId === targetUserId) return res.status(400).json({message: "Błąd."}); try { const chk = await pool.query(`SELECT * FROM friendships WHERE (user_id1=$1 AND user_id2=$2) OR (user_id1=$2 AND user_id2=$1)`, [req.user.userId, targetUserId]); if(chk.rows.length>0) return res.status(400).json({ message: 'Już istnieje.' }); await pool.query(`INSERT INTO friendships (user_id1, user_id2, status) VALUES ($1, $2, 'pending')`, [req.user.userId, targetUserId]); res.json({ message: 'Wysłano.' }); const t = players.get(parseInt(targetUserId)); if(t && t.ws.readyState===1) t.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username })); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/friends/accept', authenticateToken, async (req, res) => { try { const r = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [req.body.requestId, req.user.userId]); if(r.rowCount===0) return res.status(400).json({ message: 'Błąd.' }); res.json({ message: 'Przyjęto.' }); const sid = r.rows[0].user_id1; const ss = players.get(sid); if(ss && ss.ws.readyState===1){ ss.ws.send(JSON.stringify({ type: 'friendRequestAccepted', by: req.user.username })); ss.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } const ms = players.get(parseInt(req.user.userId)); if(ms) ms.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/coins/update', authenticateToken, async (req, res) => { try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [req.body.amount, req.user.userId]); res.json({ newBalance: r.rows[0].coins }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const query = `SELECT DISTINCT ON (other_user_id) CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id, u.username AS other_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END) WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY other_user_id, m.created_at DESC`; const r = await pool.query(query, [userId]); const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); res.json(sorted); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const targetUsername = req.params.username; const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]); if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' }); const targetId = userRes.rows[0].id; const query = `SELECT m.sender_id, u.username AS sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) ORDER BY m.created_at ASC`; const r = await pool.query(query, [userId, targetId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.post('/api/parkour/complete', authenticateToken, async (req, res) => { const userId = req.user.userId; const rewardCoins = 100; const rewardXp = 500; try { const r = await pool.query('SELECT coins, level, xp FROM users WHERE id = $1', [userId]); if (r.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje." }); let { coins, level, xp } = r.rows[0]; coins = (coins || 0) + rewardCoins; xp = (xp || 0) + rewardXp; level = level || 1; let levelUpOccurred = false; while (true) { const needed = getXpForNextLevel(level); if (xp >= needed) { xp -= needed; level++; levelUpOccurred = true; } else { break; } } await pool.query(`UPDATE users SET coins = $1, level = $2, xp = $3, total_xp = COALESCE(total_xp, 0) + $5 WHERE id = $4`, [coins, level, xp, userId, rewardXp]); const nextLevelXp = getXpForNextLevel(level); res.json({ success: true, levelUp: levelUpOccurred, newCoins: coins, newLevel: level, newXp: xp, maxXp: nextLevelXp, message: levelUpOccurred ? `Awans na poziom ${level}!` : `Zdobyto ${rewardXp} XP i ${rewardCoins} monet!` }); } catch (e) { res.status(500).json({ message: "Błąd serwera." }); } });
+app.post('/api/shop/buy', authenticateToken, async (req, res) => { const { blockName, cost } = req.body; const userId = req.user.userId; try { const userResult = await pool.query('SELECT coins, owned_blocks FROM users WHERE id = $1', [userId]); if (userResult.rows.length === 0) return res.status(404).json({ message: "Użytkownik nie istnieje" }); const user = userResult.rows[0]; const currentCoins = user.coins || 0; let ownedBlocks = parseOwnedBlocks(user.owned_blocks); if (ownedBlocks.includes(blockName)) return res.status(400).json({ message: "Już posiadasz ten blok!" }); if (currentCoins < cost) return res.status(400).json({ message: "Za mało monet!" }); ownedBlocks.push(blockName); const newBalance = currentCoins - cost; await pool.query('UPDATE users SET coins = $1, owned_blocks = $2 WHERE id = $3', [newBalance, JSON.stringify(ownedBlocks), userId]); res.json({ success: true, newBalance: newBalance, ownedBlocks: ownedBlocks }); } catch (e) { res.status(500).json({ message: "Błąd transakcji." }); } });
+app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator, w.world_data->>'type' as type FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
+
 function broadcastToWorld(worldId, data, excludeId = null) { const worldStr = String(worldId); const msg = JSON.stringify(data); players.forEach((p, id) => { if (String(p.currentWorld) === worldStr && id !== excludeId && p.ws.readyState === 1) { p.ws.send(msg); } }); }
 function spawnCoin() { if (currentCoin) return; const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const pos = getSmartSpawnPosition(x, z, false); currentCoin = { position: pos }; broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position }); }
 function notifyFriendsStatus(userId, isOnline) { (async () => { try { const r = await pool.query(`SELECT user_id1, user_id2 FROM friendships WHERE (user_id1=$1 OR user_id2=$1) AND status='accepted'`, [userId]); r.rows.forEach(row => { const fid = row.user_id1 === userId ? row.user_id2 : row.user_id1; const s = players.get(fid); if(s && s.ws.readyState===1) s.ws.send(JSON.stringify({ type: 'friendStatusChange' })); }); } catch (e) {} })(); }
