@@ -145,29 +145,29 @@ async function autoMigrate() {
         await addCol('users', 'pending_xp', 'INTEGER DEFAULT 0');
         await addCol('users', 'total_xp', 'BIGINT DEFAULT 0');
 
-        // NEXUS MAP
+        // MAPY
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
         if (mapCheck.rowCount === 0) { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`); }
 
-        // LOGIN MAP (NOWOŚĆ)
         await pool.query(`CREATE TABLE IF NOT EXISTS login_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const loginMapCheck = await pool.query(`SELECT id FROM login_map WHERE id = 1`);
         if (loginMapCheck.rowCount === 0) { await pool.query(`INSERT INTO login_map (id, map_data) VALUES (1, '[]'::jsonb)`); }
 
-        // Skins
+        // CONTENT
         await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        // NOWOŚĆ: Tabela na skiny startowe (bez owner_id, bo są systemowe)
+        await pool.query(`CREATE TABLE IF NOT EXISTS starter_skins (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES skin_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
-        // Prefabs
         await pool.query(`CREATE TABLE IF NOT EXISTS prefabs (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_likes (id SERIAL PRIMARY KEY, prefab_id INTEGER REFERENCES prefabs(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(prefab_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_comments (id SERIAL PRIMARY KEY, prefab_id INTEGER REFERENCES prefabs(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES prefab_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
-        // Parts
         await pool.query(`CREATE TABLE IF NOT EXISTS hypercube_parts (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_likes (id SERIAL PRIMARY KEY, part_id INTEGER REFERENCES hypercube_parts(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(part_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_comments (id SERIAL PRIMARY KEY, part_id INTEGER REFERENCES hypercube_parts(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
@@ -306,12 +306,11 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
 app.get('/api/nexus', async (req, res) => { if (nexusBlocksCache && nexusBlocksCache.length > 0) return res.json(nexusBlocksCache); try { const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1'); if (result.rows.length > 0) { nexusBlocksCache = result.rows[0].map_data || []; return res.json(nexusBlocksCache); } res.json([]); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/nexus', authenticateToken, async (req, res) => { const { blocks } = req.body; try { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]); nexusBlocksCache = blocks; res.json({ message: 'Zapisano!' }); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// --- LOGIN MAP API (NOWOŚĆ) ---
+// --- LOGIN MAP API ---
 app.get('/api/login-map', async (req, res) => {
     try {
         const result = await pool.query('SELECT map_data FROM login_map WHERE id = 1');
         if (result.rows.length > 0) {
-            // Jeśli mapa jest pusta w bazie, zwróć pustą tablicę
             return res.json(result.rows[0].map_data || []);
         }
         res.json([]);
@@ -323,6 +322,22 @@ app.post('/api/login-map', authenticateToken, async (req, res) => {
     try {
         await pool.query(`INSERT INTO login_map (id, map_data) VALUES (1, $1) ON CONFLICT (id) DO UPDATE SET map_data = $1`, [JSON.stringify(blocks)]);
         res.json({ message: 'Mapa logowania zapisana!' });
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+// --- STARTER SKINS API (NOWOŚĆ) ---
+app.get('/api/starter-skins', async (req, res) => {
+    try {
+        const r = await pool.query('SELECT * FROM starter_skins ORDER BY id ASC');
+        res.json(r.rows);
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/starter-skins', authenticateToken, async (req, res) => {
+    const { name, blocks, thumbnail } = req.body;
+    try {
+        await pool.query(`INSERT INTO starter_skins (name, blocks_data, thumbnail) VALUES ($1, $2, $3)`, [name, JSON.stringify(blocks), thumbnail]);
+        res.json({ message: 'Skin startowy zapisany!' });
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
@@ -400,6 +415,7 @@ app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
         res.status(500).json({ message: "Błąd serwera" });
     }
 });
+
 
 // --- API ENDPOINTS (Common) ---
 app.get('/api/news', authenticateToken, async (req, res) => {
@@ -487,7 +503,7 @@ app.get('/api/user/me', authenticateToken, async (req, res) => {
                 level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp,
                 pendingXp: newsCount,
                 created_at: u.created_at,
-                currentSkinId: u.current_skin_id // WAŻNE
+                currentSkinId: u.current_skin_id 
             }, 
             thumbnail: u.current_skin_thumbnail 
         }); 
@@ -549,6 +565,8 @@ app.post('/api/shop/buy', authenticateToken, async (req, res) => { const { block
 app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, world_data, thumbnail } = req.body; if (!name || !world_data) return res.status(400).json({ message: "Brak danych." }); try { const r = await pool.query(`INSERT INTO worlds (owner_id, name, world_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [req.user.userId, name, JSON.stringify(world_data), thumbnail]); res.status(201).json({ message: 'Zapisano.', worldId: r.rows[0].id }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator, w.world_data->>'type' as type FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
+
+// --- AUTH ---
 app.post('/api/register', async (req, res) => {
     const { username, password, starterSkin } = req.body;
     try {
