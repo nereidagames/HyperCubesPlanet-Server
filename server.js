@@ -22,6 +22,7 @@ app.use(cors({
 }));
 app.options('*', cors()); 
 
+// Zwiększony limit dla przesyłania dużych skinów/map
 app.use(express.json({ limit: '50mb' })); 
 
 const server = http.createServer(app);
@@ -32,27 +33,37 @@ const pool = new Pool({
   ssl: { rejectUnauthorized: false } 
 });
 
+// Zmienne globalne gry
 const players = new Map();
 let currentCoin = null;
 const MAP_BOUNDS = 30;
 
+// Tabela poziomów (XP potrzebne na kolejny level)
 const XP_TABLE = [50, 75, 125, 150, 350, 750, 1500, 2000, 3000, 4000];
 
 function getXpForNextLevel(currentLevel) {
     if (currentLevel <= XP_TABLE.length) {
         return XP_TABLE[currentLevel - 1];
     }
+    // Dla wyższych leveli: 4000 + 1000 za każdy level powyżej 10
     return 4000 + ((currentLevel - 10) * 1000);
 }
 
+// Cache mapy Nexusa w pamięci RAM
 let nexusBlocksCache = [];
 
-// --- DATABASE FUNCTIONS ---
+// ==========================================
+// FUNKCJE POMOCNICZE BAZY DANYCH
+// ==========================================
 
 async function loadNexusMapToMemory() {
     try {
+        // Sprawdź czy tabela istnieje
         const tableCheck = await pool.query(`SELECT to_regclass('public.nexus_map');`);
-        if (!tableCheck.rows[0].to_regclass) return;
+        if (!tableCheck.rows[0].to_regclass) {
+            console.log("[Server] Tabela nexus_map nie istnieje, pomijam ładowanie.");
+            return;
+        }
 
         const result = await pool.query('SELECT map_data FROM nexus_map WHERE id = 1');
         if (result.rows.length > 0) {
@@ -60,6 +71,7 @@ async function loadNexusMapToMemory() {
             console.log(`[Server] Załadowano mapę Nexusa: ${nexusBlocksCache.length} bloków.`);
         } else {
             nexusBlocksCache = [];
+            console.log("[Server] Mapa Nexusa jest pusta.");
         }
     } catch (e) {
         console.error("[Server] Błąd cache mapy:", e.message);
@@ -67,6 +79,7 @@ async function loadNexusMapToMemory() {
     }
 }
 
+// Inteligentny spawn (żeby nie rodzić się w bloku)
 function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     let highestBlock = null;
     let highestY = -1000;
@@ -101,6 +114,7 @@ function getSmartSpawnPosition(targetX, targetZ, isPlayer = false) {
     }
 }
 
+// Middleware autoryzacji
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -113,6 +127,7 @@ const authenticateToken = (req, res, next) => {
     });
 };
 
+// Pingowanie WebSocketów (Keep-Alive)
 const interval = setInterval(function ping() {
   wss.clients.forEach(function each(ws) {
     if (ws.isAlive === false) return ws.terminate();
@@ -121,13 +136,24 @@ const interval = setInterval(function ping() {
   });
 }, 30000);
 
-app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
+// ==========================================
+// MIGRACJA BAZY DANYCH (Tworzenie tabel)
+// ==========================================
 
 async function autoMigrate() {
-    console.log("[Server] Migracja bazy danych...");
+    console.log("[Server] Sprawdzanie i migracja bazy danych...");
     try {
-        await pool.query(`CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, username VARCHAR(50) UNIQUE NOT NULL, password_hash VARCHAR(100) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        // Tabela Użytkowników
+        await pool.query(`
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY, 
+                username VARCHAR(50) UNIQUE NOT NULL, 
+                password_hash VARCHAR(100) NOT NULL, 
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        `);
         
+        // Aktualizacja kolumn użytkownika
         const addCol = async (table, col, type) => {
             try { await pool.query(`ALTER TABLE ${table} ADD COLUMN IF NOT EXISTS ${col} ${type};`); } catch(e){}
         };
@@ -141,38 +167,45 @@ async function autoMigrate() {
         await addCol('users', 'pending_xp', 'INTEGER DEFAULT 0');
         await addCol('users', 'total_xp', 'BIGINT DEFAULT 0');
 
-        // MAPY
+        // MAPA NEXUSA
         await pool.query(`CREATE TABLE IF NOT EXISTS nexus_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const mapCheck = await pool.query(`SELECT id FROM nexus_map WHERE id = 1`);
         if (mapCheck.rowCount === 0) { await pool.query(`INSERT INTO nexus_map (id, map_data) VALUES (1, '[]'::jsonb)`); }
 
+        // MAPA LOGOWANIA
         await pool.query(`CREATE TABLE IF NOT EXISTS login_map (id INTEGER PRIMARY KEY CHECK (id = 1), map_data JSONB);`);
         const loginMapCheck = await pool.query(`SELECT id FROM login_map WHERE id = 1`);
         if (loginMapCheck.rowCount === 0) { await pool.query(`INSERT INTO login_map (id, map_data) VALUES (1, '[]'::jsonb)`); }
 
-        // CONTENT
+        // SKINY
         await pool.query(`CREATE TABLE IF NOT EXISTS skins (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
+        
+        // SKINY STARTOWE (SYSTEMOWE)
         await pool.query(`CREATE TABLE IF NOT EXISTS starter_skins (id SERIAL PRIMARY KEY, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
 
+        // LIKE & KOMENTARZE - SKINY
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_likes (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(skin_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comments (id SERIAL PRIMARY KEY, skin_id INTEGER REFERENCES skins(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS skin_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES skin_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
+        // PREFABRYKATY
         await pool.query(`CREATE TABLE IF NOT EXISTS prefabs (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_likes (id SERIAL PRIMARY KEY, prefab_id INTEGER REFERENCES prefabs(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(prefab_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_comments (id SERIAL PRIMARY KEY, prefab_id INTEGER REFERENCES prefabs(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS prefab_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES prefab_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
+        // CZĘŚCI (PARTS)
         await pool.query(`CREATE TABLE IF NOT EXISTS hypercube_parts (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, blocks_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_likes (id SERIAL PRIMARY KEY, part_id INTEGER REFERENCES hypercube_parts(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(part_id, user_id));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_comments (id SERIAL PRIMARY KEY, part_id INTEGER REFERENCES hypercube_parts(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, text TEXT NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS part_comment_likes (id SERIAL PRIMARY KEY, comment_id INTEGER REFERENCES part_comments(id) NOT NULL, user_id INTEGER REFERENCES users(id) NOT NULL, UNIQUE(comment_id, user_id));`);
 
-        // Social & News
+        // SPOŁECZNOŚCIOWE
         await pool.query(`CREATE TABLE IF NOT EXISTS friendships (id SERIAL PRIMARY KEY, user_id1 INTEGER REFERENCES users(id) NOT NULL, user_id2 INTEGER REFERENCES users(id) NOT NULL, status VARCHAR(20) DEFAULT 'pending', created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id1, user_id2));`);
         await pool.query(`CREATE TABLE IF NOT EXISTS worlds (id SERIAL PRIMARY KEY, owner_id INTEGER REFERENCES users(id) NOT NULL, name VARCHAR(100) NOT NULL, thumbnail TEXT, world_data JSONB NOT NULL, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         await pool.query(`CREATE TABLE IF NOT EXISTS private_messages (id SERIAL PRIMARY KEY, sender_id INTEGER REFERENCES users(id) NOT NULL, recipient_id INTEGER REFERENCES users(id) NOT NULL, message_text TEXT NOT NULL, is_read BOOLEAN DEFAULT false, created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP);`);
         
+        // NEWSY
         await pool.query(`
             CREATE TABLE IF NOT EXISTS user_news (
                 id SERIAL PRIMARY KEY,
@@ -205,7 +238,8 @@ function parseOwnedBlocks(dbValue) {
     return ["Ziemia"];
 }
 
-// HELPERS
+// --- HELPERY LOGIKI ---
+
 async function addNews(userId, type, sourceUserId, targetId, targetName, targetThumbnail, xp, coins) {
     try {
         await pool.query(`
@@ -217,6 +251,7 @@ async function addNews(userId, type, sourceUserId, targetId, targetName, targetT
     }
 }
 
+// Uniwersalna obsługa lajków
 async function handleLike(req, res, tableName, colName, parentTableName) {
     const objId = req.params.id;
     const userId = req.user.userId;
@@ -226,6 +261,7 @@ async function handleLike(req, res, tableName, colName, parentTableName) {
             await pool.query(`DELETE FROM ${tableName} WHERE ${colName} = $1 AND user_id = $2`, [objId, userId]);
         } else {
             await pool.query(`INSERT INTO ${tableName} (${colName}, user_id) VALUES ($1, $2)`, [objId, userId]);
+            // Powiadomienie właściciela obiektu
             const ownerRes = await pool.query(`SELECT owner_id, name, thumbnail FROM ${parentTableName} WHERE id = $1`, [objId]);
             if (ownerRes.rows.length > 0) {
                 const { owner_id, name, thumbnail } = ownerRes.rows[0];
@@ -242,6 +278,7 @@ async function handleLike(req, res, tableName, colName, parentTableName) {
     }
 }
 
+// Uniwersalna obsługa komentarzy
 async function handleGetComments(req, res, tableName, likesTable, colName) {
     const objId = req.params.id;
     try {
@@ -279,6 +316,7 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
             await pool.query(`DELETE FROM ${tableName} WHERE comment_id=$1 AND user_id=$2`, [commentId, userId]);
         } else {
             await pool.query(`INSERT INTO ${tableName} (comment_id, user_id) VALUES ($1, $2)`, [commentId, userId]);
+            // Powiadomienie autora komentarza
             const authorRes = await pool.query(`SELECT user_id, text FROM ${commentsTable} WHERE id = $1`, [commentId]);
             if(authorRes.rows.length > 0) {
                 const { user_id, text } = authorRes.rows[0];
@@ -292,7 +330,107 @@ async function handleLikeComment(req, res, tableName, commentsTable) {
     } catch (e) { res.status(500).json({message: "DB Error"}); }
 }
 
-// --- NEXUS API ---
+// ==========================================
+// API ENDPOINTS
+// ==========================================
+
+app.get('/', (req, res) => res.send('Serwer HyperCubesPlanet działa!'));
+
+// --- AUTOLOGIN (To, czego brakowało) ---
+app.get('/api/user/me', authenticateToken, async (req, res) => { 
+    try { 
+        const r = await pool.query('SELECT id, username, coins, current_skin_thumbnail, current_skin_id, owned_blocks, level, xp, pending_xp, created_at FROM users WHERE id = $1', [req.user.userId]); 
+        if (r.rows.length === 0) return res.status(404).send(); 
+        
+        const u = r.rows[0]; 
+        const nextLevelXp = getXpForNextLevel(u.level || 1); 
+        
+        const newsCountRes = await pool.query('SELECT COUNT(*) FROM user_news WHERE user_id = $1 AND is_claimed = false', [u.id]);
+        const newsCount = parseInt(newsCountRes.rows[0].count);
+
+        res.json({ 
+            user: { 
+                id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), 
+                level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp,
+                pendingXp: newsCount,
+                created_at: u.created_at,
+                currentSkinId: u.current_skin_id 
+            }, 
+            thumbnail: u.current_skin_thumbnail 
+        }); 
+    } catch (e) { res.status(500).json({ message: e.message }); } 
+});
+
+// --- AUTH & SETUP ---
+app.get('/api/init-database', async (req, res) => {
+    await autoMigrate();
+    res.send("Migracja uruchomiona ręcznie.");
+});
+
+app.post('/api/register', async (req, res) => {
+    const { username, password, starterSkin } = req.body;
+    try {
+        const hash = await bcrypt.hash(password, 10);
+        
+        // 1. Utwórz usera
+        const userRes = await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp, total_xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0, 0) RETURNING id`, [username, hash]);
+        const userId = userRes.rows[0].id;
+
+        // 2. Jeśli wybrano skin startowy
+        if (starterSkin) {
+            const thumb = "icons/avatar_placeholder.png"; 
+            const blocks = JSON.stringify(starterSkin.blocks);
+            const skinName = starterSkin.name || "Mój pierwszy skin";
+
+            // Zapisz skin
+            const skinRes = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [userId, skinName, blocks, thumb]);
+            const skinId = skinRes.rows[0].id;
+
+            // Przypisz skin do usera
+            await pool.query(`UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`, [skinId, thumb, userId]);
+        }
+        res.status(201).json({ message: 'Utworzono.' });
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/login', async (req, res) => {
+    const { username, password } = req.body;
+    try {
+        const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
+        const u = r.rows[0];
+        
+        if (!u || !(await bcrypt.compare(password, u.password_hash))) {
+            return res.status(401).json({ message: 'Błąd logowania.' });
+        }
+        
+        const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
+        const nextLevelXp = getXpForNextLevel(u.level || 1);
+        
+        res.json({ 
+            token, 
+            user: { 
+                id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), 
+                level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp, 
+                currentSkinId: u.current_skin_id 
+            }, 
+            thumbnail: u.current_skin_thumbnail 
+        });
+    } catch (e) { res.status(500).json({ message: e.message }); }
+});
+
+app.post('/api/user/equip', authenticateToken, async (req, res) => {
+    const { skinId, thumbnail } = req.body;
+    const userId = req.user.userId;
+    try {
+        const check = await pool.query('SELECT id FROM skins WHERE id = $1 AND owner_id = $2', [skinId, userId]);
+        if (check.rows.length === 0) return res.status(403).json({ message: "Nie posiadasz tego skina." });
+        
+        await pool.query(`UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`, [skinId, thumbnail, userId]);
+        res.json({ success: true });
+    } catch (e) { res.status(500).json({ message: "Błąd bazy." }); }
+});
+
+// --- NEXUS ---
 app.get('/api/nexus', async (req, res) => {
     if (nexusBlocksCache && nexusBlocksCache.length > 0) return res.json(nexusBlocksCache);
     try {
@@ -314,7 +452,7 @@ app.post('/api/nexus', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- LOGIN MAP API ---
+// --- LOGIN MAP ---
 app.get('/api/login-map', async (req, res) => {
     try {
         const result = await pool.query('SELECT map_data FROM login_map WHERE id = 1');
@@ -333,7 +471,7 @@ app.post('/api/login-map', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- STARTER SKINS API ---
+// --- STARTER SKINS ---
 app.get('/api/starter-skins', async (req, res) => {
     try {
         const r = await pool.query('SELECT * FROM starter_skins ORDER BY id ASC');
@@ -349,67 +487,16 @@ app.post('/api/starter-skins', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: e.message }); }
 });
 
-// --- FRIENDS API (TU BYŁ BŁĄD WCZEŚNIEJ, TERAZ NAPRAWIONE) ---
-app.get('/api/friends', authenticateToken, async (req, res) => {
+// --- PROFILE & WALL ---
+app.get('/api/user/profile/:username', authenticateToken, async (req, res) => {
     try {
-        const r = await pool.query(`SELECT u.id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = (CASE WHEN f.user_id1 = $1 THEN f.user_id2 ELSE f.user_id1 END) WHERE (f.user_id1 = $1 OR f.user_id2 = $1) AND f.status = 'accepted'`, [req.user.userId]);
-        const reqs = await pool.query(`SELECT f.id as request_id, u.id as user_id, u.username, u.current_skin_thumbnail FROM friendships f JOIN users u ON u.id = f.user_id1 WHERE f.user_id2 = $1 AND f.status = 'pending'`, [req.user.userId]);
-        const friends = r.rows.map(f => ({ ...f, isOnline: players.has(f.id) }));
-        res.json({ friends, requests: reqs.rows });
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/friends/search', authenticateToken, async (req, res) => {
-    try {
-        const r = await pool.query(`SELECT id, username, current_skin_thumbnail FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10`, [`%${req.body.query}%`, req.user.userId]);
-        res.json(r.rows);
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/friends/request', authenticateToken, async (req, res) => {
-    const { targetUserId } = req.body;
-    if(req.user.userId === targetUserId) return res.status(400).json({message: "Błąd."});
-    try {
-        const chk = await pool.query(`SELECT * FROM friendships WHERE (user_id1=$1 AND user_id2=$2) OR (user_id1=$2 AND user_id2=$1)`, [req.user.userId, targetUserId]);
-        if(chk.rows.length>0) return res.status(400).json({ message: 'Już istnieje.' });
-        await pool.query(`INSERT INTO friendships (user_id1, user_id2, status) VALUES ($1, $2, 'pending')`, [req.user.userId, targetUserId]);
-        res.json({ message: 'Wysłano.' });
-        const t = players.get(parseInt(targetUserId));
-        if(t && t.ws.readyState===1) t.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username }));
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/friends/accept', authenticateToken, async (req, res) => {
-    try {
-        const r = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [req.body.requestId, req.user.userId]);
-        if(r.rowCount===0) return res.status(400).json({ message: 'Błąd.' });
-        res.json({ message: 'Przyjęto.' });
-        const sid = r.rows[0].user_id1;
-        const ss = players.get(sid);
-        if(ss && ss.ws.readyState===1){
-            ss.ws.send(JSON.stringify({ type: 'friendRequestAccepted', by: req.user.username }));
-            ss.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
-        }
-        const ms = players.get(parseInt(req.user.userId));
-        if(ms) ms.ws.send(JSON.stringify({ type: 'friendStatusChange' }));
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.delete('/api/friends/:id', authenticateToken, async (req, res) => {
-    const targetId = parseInt(req.params.id);
-    const myId = req.user.userId;
-    try {
-        const r = await pool.query(`DELETE FROM friendships WHERE (user_id1 = $1 AND user_id2 = $2) OR (user_id1 = $2 AND user_id2 = $1)`, [myId, targetId]);
-        if (r.rowCount === 0) return res.status(404).json({ message: "Nie jesteście znajomymi." });
-        res.json({ success: true, message: "Usunięto ze znajomych." });
-        [myId, targetId].forEach(pid => {
-            const p = players.get(pid);
-            if (p && p.ws.readyState === 1) { p.ws.send(JSON.stringify({ type: 'friendStatusChange' })); }
-        });
+        const { username } = req.params;
+        const r = await pool.query('SELECT id, username, level, created_at, current_skin_thumbnail FROM users WHERE username = $1', [username]);
+        if (r.rows.length === 0) return res.status(404).json({ message: "Gracz nie znaleziony" });
+        res.json(r.rows[0]);
     } catch (e) { res.status(500).json({ message: "Błąd serwera" }); }
 });
 
-// --- USER & SOCIAL API ---
 app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     const targetUserId = req.params.id;
     try {
@@ -423,16 +510,7 @@ app.get('/api/user/:id/wall', authenticateToken, async (req, res) => {
     } catch (e) { res.status(500).json({ message: "Błąd pobierania ściany" }); }
 });
 
-app.get('/api/user/profile/:username', authenticateToken, async (req, res) => {
-    try {
-        const { username } = req.params;
-        const r = await pool.query('SELECT id, username, level, created_at, current_skin_thumbnail FROM users WHERE username = $1', [username]);
-        if (r.rows.length === 0) return res.status(404).json({ message: "Gracz nie znaleziony" });
-        res.json(r.rows[0]);
-    } catch (e) { res.status(500).json({ message: "Błąd serwera" }); }
-});
-
-// --- CONTENT API ---
+// --- CONTENT ENDPOINTS (Rozwinięte) ---
 app.get('/api/skins/all', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id ORDER BY s.created_at DESC LIMIT 50`; const r = await pool.query(query); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/mine', authenticateToken, async (req, res) => { try { const query = `SELECT s.id, s.name, s.thumbnail, s.owner_id, s.created_at, u.username as creator, u.level as "creatorLevel", u.current_skin_thumbnail as "creatorThumbnail", (SELECT COUNT(*) FROM skin_likes sl WHERE sl.skin_id = s.id) as likes, (SELECT COUNT(*) FROM skin_comments sc WHERE sc.skin_id = s.id) as comments FROM skins s JOIN users u ON s.owner_id = u.id WHERE s.owner_id = $1 ORDER BY s.created_at DESC`; const r = await pool.query(query, [req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/skins/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT blocks_data FROM skins WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].blocks_data); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -457,6 +535,9 @@ app.post('/api/parts/:id/like', authenticateToken, async (req, res) => { handleL
 app.get('/api/parts/:id/comments', authenticateToken, async (req, res) => { handleGetComments(req, res, 'part_comments', 'part_comment_likes', 'part_id'); });
 app.post('/api/parts/:id/comments', authenticateToken, async (req, res) => { handlePostComment(req, res, 'part_comments', 'part_id'); });
 app.post('/api/parts/comments/:id/like', authenticateToken, async (req, res) => { handleLikeComment(req, res, 'part_comment_likes', 'part_comments'); });
+app.post('/api/friends/search', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT id, username, current_skin_thumbnail FROM users WHERE username ILIKE $1 AND id != $2 LIMIT 10`, [`%${req.body.query}%`, req.user.userId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.post('/api/friends/request', authenticateToken, async (req, res) => { const { targetUserId } = req.body; if(req.user.userId === targetUserId) return res.status(400).json({message: "Błąd."}); try { const chk = await pool.query(`SELECT * FROM friendships WHERE (user_id1=$1 AND user_id2=$2) OR (user_id1=$2 AND user_id2=$1)`, [req.user.userId, targetUserId]); if(chk.rows.length>0) return res.status(400).json({ message: 'Już istnieje.' }); await pool.query(`INSERT INTO friendships (user_id1, user_id2, status) VALUES ($1, $2, 'pending')`, [req.user.userId, targetUserId]); res.json({ message: 'Wysłano.' }); const t = players.get(parseInt(targetUserId)); if(t && t.ws.readyState===1) t.ws.send(JSON.stringify({ type: 'friendRequestReceived', from: req.user.username })); } catch (e) { res.status(500).json({ message: e.message }); } });
+app.post('/api/friends/accept', authenticateToken, async (req, res) => { try { const r = await pool.query(`UPDATE friendships SET status = 'accepted' WHERE id = $1 AND user_id2 = $2 AND status = 'pending' RETURNING user_id1`, [req.body.requestId, req.user.userId]); if(r.rowCount===0) return res.status(400).json({ message: 'Błąd.' }); res.json({ message: 'Przyjęto.' }); const sid = r.rows[0].user_id1; const ss = players.get(sid); if(ss && ss.ws.readyState===1){ ss.ws.send(JSON.stringify({ type: 'friendRequestAccepted', by: req.user.username })); ss.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } const ms = players.get(parseInt(req.user.userId)); if(ms) ms.ws.send(JSON.stringify({ type: 'friendStatusChange' })); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.post('/api/coins/update', authenticateToken, async (req, res) => { try { const r = await pool.query('UPDATE users SET coins = COALESCE(coins, 0) + $1 WHERE id = $2 RETURNING coins', [req.body.amount, req.user.userId]); res.json({ newBalance: r.rows[0].coins }); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const query = `SELECT DISTINCT ON (other_user_id) CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END AS other_user_id, u.username AS other_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON u.id = (CASE WHEN sender_id = $1 THEN recipient_id ELSE sender_id END) WHERE m.sender_id = $1 OR m.recipient_id = $1 ORDER BY other_user_id, m.created_at DESC`; const r = await pool.query(query, [userId]); const sorted = r.rows.sort((a, b) => new Date(b.created_at) - new Date(a.created_at)); res.json(sorted); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/messages/:username', authenticateToken, async (req, res) => { try { const userId = req.user.userId; const targetUsername = req.params.username; const userRes = await pool.query('SELECT id FROM users WHERE username = $1', [targetUsername]); if (userRes.rows.length === 0) return res.status(404).json({ message: 'Użytkownik nie istnieje.' }); const targetId = userRes.rows[0].id; const query = `SELECT m.sender_id, u.username AS sender_username, m.message_text, m.created_at FROM private_messages m JOIN users u ON m.sender_id = u.id WHERE (m.sender_id = $1 AND m.recipient_id = $2) OR (m.sender_id = $2 AND m.recipient_id = $1) ORDER BY m.created_at ASC`; const r = await pool.query(query, [userId, targetId]); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
@@ -466,49 +547,7 @@ app.post('/api/worlds', authenticateToken, async (req, res) => { const { name, w
 app.get('/api/worlds/all', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT w.id, w.name, w.thumbnail, w.owner_id, u.username as creator, w.world_data->>'type' as type FROM worlds w JOIN users u ON w.owner_id = u.id ORDER BY w.created_at DESC LIMIT 50`); res.json(r.rows); } catch (e) { res.status(500).json({ message: e.message }); } });
 app.get('/api/worlds/:id', authenticateToken, async (req, res) => { try { const r = await pool.query(`SELECT world_data FROM worlds WHERE id = $1`, [req.params.id]); if (r.rows.length === 0) return res.status(404).json({ message: 'Nie znaleziono.' }); res.json(r.rows[0].world_data); } catch (e) { res.status(500).json({ message: e.message }); } });
 
-// --- AUTH ---
-app.post('/api/register', async (req, res) => {
-    const { username, password, starterSkin } = req.body;
-    try {
-        const hash = await bcrypt.hash(password, 10);
-        const userRes = await pool.query(`INSERT INTO users (username, password_hash, coins, owned_blocks, level, xp, total_xp) VALUES ($1, $2, 0, '["Ziemia"]'::jsonb, 1, 0, 0) RETURNING id`, [username, hash]);
-        const userId = userRes.rows[0].id;
-
-        if (starterSkin) {
-            const thumb = "icons/avatar_placeholder.png"; 
-            const blocks = JSON.stringify(starterSkin.blocks);
-            const skinName = starterSkin.name || "Mój pierwszy skin";
-            const skinRes = await pool.query(`INSERT INTO skins (owner_id, name, blocks_data, thumbnail) VALUES ($1, $2, $3, $4) RETURNING id`, [userId, skinName, blocks, thumb]);
-            const skinId = skinRes.rows[0].id;
-            await pool.query(`UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`, [skinId, thumb, userId]);
-        }
-        res.status(201).json({ message: 'Utworzono.' });
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/login', async (req, res) => {
-    const { username, password } = req.body;
-    try {
-        const r = await pool.query('SELECT * FROM users WHERE username = $1', [username]);
-        const u = r.rows[0];
-        if (!u || !(await bcrypt.compare(password, u.password_hash))) return res.status(401).json({ message: 'Błąd logowania.' });
-        const token = jwt.sign({ userId: u.id, username: u.username }, process.env.JWT_SECRET, { expiresIn: '7d' });
-        const nextLevelXp = getXpForNextLevel(u.level || 1);
-        res.json({ token, user: { id: u.id, username: u.username, coins: u.coins || 0, ownedBlocks: parseOwnedBlocks(u.owned_blocks), level: u.level || 1, xp: u.xp || 0, maxXp: nextLevelXp, currentSkinId: u.current_skin_id }, thumbnail: u.current_skin_thumbnail });
-    } catch (e) { res.status(500).json({ message: e.message }); }
-});
-
-app.post('/api/user/equip', authenticateToken, async (req, res) => {
-    const { skinId, thumbnail } = req.body;
-    const userId = req.user.userId;
-    try {
-        const check = await pool.query('SELECT id FROM skins WHERE id = $1 AND owner_id = $2', [skinId, userId]);
-        if (check.rows.length === 0) return res.status(403).json({ message: "Nie posiadasz tego skina." });
-        await pool.query(`UPDATE users SET current_skin_id = $1, current_skin_thumbnail = $2 WHERE id = $3`, [skinId, thumbnail, userId]);
-        res.json({ success: true });
-    } catch (e) { res.status(500).json({ message: "Błąd bazy." }); }
-});
-
+// --- OBSŁUGA WEBSOCKET ---
 function broadcastToWorld(worldId, data, excludeId = null) { const worldStr = String(worldId); const msg = JSON.stringify(data); players.forEach((p, id) => { if (String(p.currentWorld) === worldStr && id !== excludeId && p.ws.readyState === 1) { p.ws.send(msg); } }); }
 function spawnCoin() { if (currentCoin) return; const x = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const z = Math.floor((Math.random() - 0.5) * 2 * MAP_BOUNDS) + 0.5; const pos = getSmartSpawnPosition(x, z, false); currentCoin = { position: pos }; broadcastToWorld('nexus', { type: 'coinSpawned', position: currentCoin.position }); }
 function notifyFriendsStatus(userId, isOnline) { (async () => { try { const r = await pool.query(`SELECT user_id1, user_id2 FROM friendships WHERE (user_id1=$1 OR user_id2=$1) AND status='accepted'`, [userId]); r.rows.forEach(row => { const fid = row.user_id1 === userId ? row.user_id2 : row.user_id1; const s = players.get(fid); if(s && s.ws.readyState===1) s.ws.send(JSON.stringify({ type: 'friendStatusChange' })); }); } catch (e) {} })(); }
